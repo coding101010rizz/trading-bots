@@ -1024,6 +1024,115 @@ def check_consolidation_job():
 
 
 # ─────────────────────────────────────────────
+# END OF DAY AUTO-FILL
+# Runs at 1pm PDT — automatically fills outcome
+# columns for today's rows in the CSV log
+# ─────────────────────────────────────────────
+def eod_autofill(close_price):
+    """
+    At market close (1pm PDT), automatically fills:
+    - outcome_direction: UP / DOWN / CHOP
+    - outcome_points: how many points SPY moved
+    - signal_correct: whether the morning GEX signal was right
+
+    Only fills rows from today that are still blank.
+    You still manually fill: notes column for context.
+    """
+    try:
+        today_str = date.today().strftime("%Y-%m-%d")
+
+        if not os.path.exists(LOG_FILE):
+            return
+
+        rows = []
+        with open(LOG_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        if not rows:
+            return
+
+        # Find today's opening price from first log entry of today
+        today_rows = [r for r in rows if r["date"] == today_str]
+        if not today_rows:
+            return
+
+        open_price = float(today_rows[0]["price"])
+        point_move = round(close_price - open_price, 2)
+
+        if abs(point_move) < 1.0:
+            direction = "CHOP"
+        elif point_move > 0:
+            direction = "UP"
+        else:
+            direction = "DOWN"
+
+        # Get morning signal — first directional reading of the day
+        morning_signal = None
+        for r in today_rows:
+            if "DIRECTIONAL" in r.get("gex_state", ""):
+                morning_signal = r["gex_state"]
+                break
+            elif r.get("gex_state") in ["NEUTRAL", "WATCH", "COUNTER"]:
+                morning_signal = r["gex_state"]
+                break
+
+        # Determine if signal was correct
+        if morning_signal and "DIRECTIONAL" in morning_signal:
+            if "BEARISH" in morning_signal and direction == "DOWN":
+                correct = "YES"
+            elif "BULLISH" in morning_signal and direction == "UP":
+                correct = "YES"
+            elif direction == "CHOP":
+                correct = "PARTIAL"
+            else:
+                correct = "NO"
+        elif morning_signal in ["NEUTRAL", "WATCH", "COUNTER"]:
+            correct = "YES" if direction == "CHOP" else "PARTIAL"
+        else:
+            correct = ""
+
+        # Update today's rows that have blank outcome columns
+        updated = 0
+        for r in rows:
+            if r["date"] == today_str and r["outcome_direction"] == "":
+                r["outcome_direction"] = direction
+                r["outcome_points"] = point_move
+                r["signal_correct"] = correct
+                updated += 1
+
+        # Write back to CSV
+        with open(LOG_FILE, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        # Send end of day summary to Telegram
+        now_str = datetime.now().strftime("%H:%M")
+        signal_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
+
+        alert(
+            f"📊 END OF DAY SUMMARY — SPY\n"
+            f"{'─'*35}\n"
+            f"Date: {today_str} | Time: {now_str}\n\n"
+            f"Open: ${round(open_price, 2)}\n"
+            f"Close: ${round(close_price, 2)}\n"
+            f"Move: {'+' if point_move > 0 else ''}{point_move} pts\n"
+            f"Direction: {direction}\n\n"
+            f"Morning Signal: {morning_signal or 'None'}\n"
+            f"Signal Correct: {signal_emoji} {correct}\n\n"
+            f"📝 {updated} log rows updated automatically\n"
+            f"→ Open spy_gex_log.csv to add notes column\n"
+            f"   (e.g. Iran news, Fed day, OPEX expiry)"
+        )
+
+        print(f"EOD autofill complete — {updated} rows updated | {direction} {point_move}pts | Correct: {correct}")
+
+    except Exception as e:
+        print(f"EOD autofill error: {e}")
+
+
+# ─────────────────────────────────────────────
 # MAIN JOB — unified
 # ─────────────────────────────────────────────
 def run_job():
@@ -1243,8 +1352,9 @@ def run_job():
                 state["velocity_score_sent"] = True
                 print(f"Morning report sent. Score: {conv}/100")
 
-        # Reset daily flags
+        # Reset daily flags + end of day auto-fill
         if h >= 13:
+            eod_autofill(price)
             state["velocity_score_sent"] = False
             state["consolidation_alert_sent"] = False
             state["hedge_unwind_alert_sent"] = False
