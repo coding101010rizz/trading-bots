@@ -3,3 +3,4 @@ schedule
 python-telegram-bot
 python-dotenv
 yfinance
+numpy
