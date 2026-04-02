@@ -165,6 +165,7 @@ state = {
     # Persistence tracking
     "last_git_push": 0,
     "github_csv_sha": "",   # SHA cached from GitHub — needed for API updates
+    "true_session_close": None,  # Real close from yfinance — set on startup
     # Overnight state — new
     "overnight_report_sent": False,
     "last_overnight_check": 0,
@@ -403,24 +404,22 @@ def init_log():
     """
     Called at startup — restores CSV from GitHub first,
     then creates headers if still no file exists.
-
-    This replaces the old 'create if not exists' behavior
-    with a proper startup recovery sequence.
+    Also seeds session open/high/low from real market data
+    so a mid-day deploy still has accurate numbers.
     """
     print("─" * 60)
     print("STARTUP: Initializing persistent storage...")
 
-    # Step 1: Try to restore from GitHub
+    # Step 1: Restore from GitHub
     restored = pull_csv_from_github()
 
-    # Step 2: If no GitHub data, create fresh file
+    # Step 2: Create fresh file if nothing exists
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
             writer.writeheader()
         print("📝 New CSV created (no prior data on GitHub)")
     else:
-        # File exists (either restored or already there)
         with open(LOG_FILE, "r", newline="") as f:
             existing = list(csv.DictReader(f))
         today_str = now_pdt().strftime("%Y-%m-%d")
@@ -428,11 +427,34 @@ def init_log():
         print(f"📊 CSV ready: {len(existing)} total rows, "
               f"{len(today_rows)} today")
 
-        # Step 3: Detect mid-day deploy — warn if today data is incomplete
-        if is_market_open() and len(today_rows) == 0:
-            print("⚠️  Mid-day deploy detected with 0 today rows on GitHub.")
-            print("    Rows from earlier today may not have been pushed yet.")
-            print("    This is expected if previous deploy didn't have GITHUB_TOKEN.")
+    # Step 3: Seed session state from real market data.
+    # This is the fix for mid-day deploys — the bot fetches the actual
+    # 6:30am open, session high/low, and close from yfinance so that
+    # eod_autofill has real numbers even if the bot just started at noon.
+    pdt = now_pdt()
+    h = pdt.hour
+    session_data = None
+
+    # Run this if market is open OR if we're past close (to fix EOD data)
+    if (6 <= h <= 13) or (h >= 13 and pdt.weekday() < 5):
+        print("🔍 Fetching real session data to seed open/high/low...")
+        session_data = fetch_true_session_data()
+
+    if session_data:
+        # Only set open_price if not already set (don't overwrite live session)
+        if state["open_price"] is None:
+            state["open_price"] = session_data["open"]
+            print(f"   Seeded open_price: ${session_data['open']}")
+
+        # Always update session high/low with real data
+        state["session_high"] = session_data["high"]
+        state["session_low"]  = session_data["low"]
+        print(f"   Seeded session H/L: ${session_data['high']} / "
+              f"${session_data['low']}")
+
+        # Store close for EOD autofill to use
+        state["true_session_close"] = session_data["close"]
+        print(f"   Seeded close: ${session_data['close']}")
 
     print("─" * 60)
 
@@ -2114,6 +2136,53 @@ def alert(text):
     asyncio.run(_send(text))
 
 
+def fetch_true_session_data():
+    """
+    Fetches the actual open, high, low, close for today's session
+    from yfinance using 1-minute bars.
+
+    Called at startup when the bot deploys mid-day or after close.
+    This gives eod_autofill the real numbers regardless of when
+    the bot started — so a 12pm deploy still gets the 6:30am open.
+
+    Returns: dict with open, high, low, close, or None on failure.
+    """
+    try:
+        spy = yf.download("SPY", period="1d", interval="1m", progress=False)
+        if spy.empty:
+            return None
+
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+
+        # Convert index to PDT for filtering
+        spy.index = spy.index.tz_convert("America/Los_Angeles")
+
+        # Filter to regular market hours only: 6:30am–1:00pm PDT
+        market_bars = spy.between_time("06:30", "13:00")
+        if market_bars.empty:
+            return None
+
+        true_open  = float(market_bars["Open"].iloc[0])
+        true_high  = float(market_bars["High"].max())
+        true_low   = float(market_bars["Low"].min())
+        true_close = float(market_bars["Close"].iloc[-1])
+
+        print(f"📈 True session data: O={true_open} H={true_high} "
+              f"L={true_low} C={true_close}")
+
+        return {
+            "open":  round(true_open,  2),
+            "high":  round(true_high,  2),
+            "low":   round(true_low,   2),
+            "close": round(true_close, 2),
+        }
+
+    except Exception as e:
+        print(f"fetch_true_session_data error: {e}")
+        return None
+
+
 def get_vwap():
     try:
         spy = yf.download("SPY", period="1d", interval="5m", progress=False)
@@ -2402,11 +2471,38 @@ def eod_autofill(close_price):
 
         today_rows = [r for r in rows
                       if r["date"] == today_str and r.get("session_type") == "MARKET"]
-        if not today_rows:
-            return
 
-        open_price = float(today_rows[0]["price"])
-        point_move = round(close_price - open_price, 2)
+        # ── Determine true open price ──────────────────────────────────────
+        # Priority order:
+        # 1. Real session data fetched from yfinance at startup (most accurate)
+        # 2. First logged row's price (if bot was running all day)
+        # 3. close_price as fallback (last resort — will show 0pt move)
+        true_open = state.get("open_price")   # seeded from yfinance in init_log
+
+        if true_open is None and today_rows:
+            # Bot was running and logged rows — use first row
+            true_open = float(today_rows[0]["price"])
+            print(f"EOD: using first logged price as open: ${true_open}")
+
+        if true_open is None:
+            # Mid-day deploy with no logged rows and no yfinance data
+            # Try one more time to get real session data
+            print("EOD: no open price available, fetching from yfinance...")
+            session_data = fetch_true_session_data()
+            if session_data:
+                true_open = session_data["open"]
+                state["session_high"] = session_data["high"]
+                state["session_low"]  = session_data["low"]
+            else:
+                true_open = close_price  # absolute last resort
+
+        # ── Use real close from yfinance if available ──────────────────────
+        # If bot deployed after close, close_price is whatever GEX shows now.
+        # The true_session_close from init_log is more accurate.
+        true_close = state.get("true_session_close") or close_price
+
+        open_price = true_open
+        point_move = round(true_close - open_price, 2)
 
         if abs(point_move) < 1.0:
             direction = "CHOP"
@@ -2414,6 +2510,12 @@ def eod_autofill(close_price):
             direction = "UP"
         else:
             direction = "DOWN"
+
+        # ── Detect mid-day deploy (few or no logged rows) ─────────────────
+        mid_day_deploy = len(today_rows) <= 2
+        if mid_day_deploy:
+            print(f"⚠️ EOD: mid-day deploy detected ({len(today_rows)} rows logged). "
+                  f"Using yfinance data for open/high/low.")
 
         morning_signal = None
         for r in today_rows:
@@ -2435,12 +2537,14 @@ def eod_autofill(close_price):
                 correct = "NO"
         elif morning_signal in ["NEUTRAL", "WATCH", "COUNTER"]:
             correct = "YES" if direction == "CHOP" else "PARTIAL"
+        elif mid_day_deploy:
+            correct = "PARTIAL"   # Can't fairly judge a signal we didn't see
         else:
             correct = ""
 
-        # Pull session stats BEFORE rows loop
-        session_high = state.get("session_high") or close_price
-        session_low = state.get("session_low") or close_price
+        # Use real session high/low (seeded from yfinance in init_log)
+        session_high = state.get("session_high") or true_close
+        session_low  = state.get("session_low")  or true_close
 
         updated = 0
         for r in rows:
@@ -2477,13 +2581,15 @@ def eod_autofill(close_price):
 
         eod_context = (
             f"Date: {today_str}\n"
-            f"Open: ${round(open_price,2)} | Close: ${round(close_price,2)}\n"
+            f"Open: ${round(open_price,2)} | Close: ${round(true_close,2)}\n"
             f"Move: {'+' if point_move > 0 else ''}{point_move} pts ({direction})\n"
             f"Max up: +{max_up} | Max down: -{max_down}\n"
             f"Morning signal: {morning_signal or 'None'}\n"
             f"Signal correct: {correct}\n"
-            f"Rows logged: {updated}\n"
-            f"Overnight monitoring will continue until 6am tomorrow.\n\n"
+            f"Rows logged by bot today: {len(today_rows)}"
+            + (" (⚠️ mid-day deploy — session data from yfinance, not live bot)"
+               if mid_day_deploy else "") +
+            f"\nOvernight monitoring will continue until 6am tomorrow.\n\n"
             f"{load_historical_context(days=30)}"
         )
 
@@ -2510,10 +2616,12 @@ def eod_autofill(close_price):
                 f"📊 END OF DAY — SPY\n"
                 f"{'─'*35}\n"
                 f"{today_str} | {now_str} PDT\n"
-                f"${round(open_price,2)} → ${round(close_price,2)} "
+                f"${round(open_price,2)} → ${round(true_close,2)} "
                 f"({'+' if point_move > 0 else ''}{point_move} pts) "
-                f"{signal_emoji}\n\n"
-                f"{written}\n\n"
+                f"{signal_emoji}\n"
+                + (f"⚠️ Bot deployed mid-day — session data from yfinance\n"
+                   if mid_day_deploy else "") +
+                f"\n{written}\n\n"
                 f"💾 {updated} rows saved\n"
                 f"🌙 Overnight monitoring active"
             )
@@ -2522,10 +2630,13 @@ def eod_autofill(close_price):
                 f"📊 END OF DAY — SPY\n"
                 f"{'─'*35}\n"
                 f"{today_str} | {now_str} PDT\n\n"
-                f"Open: ${round(open_price,2)} → Close: ${round(close_price,2)}\n"
+                f"Open: ${round(open_price,2)} → Close: ${round(true_close,2)}\n"
                 f"Move: {'+' if point_move > 0 else ''}{point_move} pts ({direction})\n"
-                f"Max Up: +{max_up} | Max Down: -{max_down}\n\n"
-                f"Signal: {morning_signal or 'None'}\n"
+                f"Max Up: +{max_up} | Max Down: -{max_down}\n"
+                + (f"⚠️ Mid-day deploy — {len(today_rows)} rows logged\n"
+                   f"   (open/high/low from yfinance, not live bot)\n"
+                   if mid_day_deploy else "") +
+                f"\nSignal: {morning_signal or 'None'}\n"
                 f"Correct: {signal_emoji} {correct}\n\n"
                 f"📝 {updated} rows logged\n"
                 f"💾 CSV saved | 💬 /notes to add context\n"
