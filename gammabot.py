@@ -45,19 +45,24 @@ def is_market_open():
 
 def is_overnight_window():
     """
-    Returns True during overnight monitoring window:
-    - Weekday evenings: 1pm PDT close → 6am PDT next day
-    - Weekend: Saturday + Sunday (institutions positioning)
-    - Specifically valuable: 6pm-11pm PDT (Trump speeches, Fed announcements,
-      earnings, geopolitical events, futures moves)
+    Returns True ONLY during genuine overnight hours.
+    Deliberately excludes the 1pm-6pm PDT window (right after close)
+    to prevent the EOD reset from immediately triggering overnight alerts.
+    
+    Active windows:
+    - Weekday evenings: 6pm PDT → 6am PDT next day
+    - Weekends: all day Saturday and Sunday
     """
     pdt = now_pdt()
     h = pdt.hour
+    weekday = pdt.weekday()  # 0=Mon, 6=Sun
+    
     # Weekend = always overnight monitoring
-    if pdt.weekday() >= 5:
+    if weekday >= 5:
         return True
-    # Weekday after close (1pm PDT) and before open (6am PDT)
-    return h >= 13 or h < 6
+    # Weekday: only 6pm onwards OR before 6am
+    # Deliberately skips 1pm-6pm to avoid post-EOD spam
+    return h >= 18 or h < 6
 
 # ─────────────────────────────────────────────
 # LOGGING SYSTEM v3 — Full ML Dataset
@@ -2560,9 +2565,9 @@ def eod_autofill(close_price):
             "oi": state.get("previous_oi_gex"),
             "vol": state.get("previous_vol_gex")
         }
-        # Reset overnight alert counter for new session
-        state["overnight_alerts_today"] = 0
-        state["overnight_report_sent"] = False
+        # NOTE: Do NOT reset overnight_alerts_today or last_overnight_check here.
+        # Those must persist so the 2hr guard works after EOD.
+        # They reset naturally at midnight via midnight_reset().
 
         # Commit to GitHub — EOD forces a push regardless of rate limit
         git_commit_log(reason="eod")
@@ -3182,10 +3187,15 @@ def check_telegram_commands():
 # MIDNIGHT RESET
 # ─────────────────────────────────────────────
 def midnight_reset():
+    """Resets daily flags at midnight PDT for the new trading day."""
     pdt = now_pdt()
-    if pdt.hour == 0:
+    if pdt.hour == 0 and pdt.minute < 1:  # Only fires in the 00:00 minute
         state["eod_fired_today"] = False
-        print("🌙 Midnight reset — EOD flag cleared for new trading day")
+        # Reset overnight counters for the new day
+        state["overnight_alerts_today"] = 0
+        state["overnight_report_sent"] = False
+        state["last_overnight_check"] = 0
+        print("🌙 Midnight reset — daily flags cleared for new trading day")
 
 
 # ─────────────────────────────────────────────
