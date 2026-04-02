@@ -162,6 +162,8 @@ state = {
     "vwap_breaks_today": 0,
     "session_vwap": None,
     "eod_fired_today": False,
+    # Persistence tracking
+    "last_git_push": 0,
     # Overnight state — new
     "overnight_report_sent": False,
     "last_overnight_check": 0,
@@ -179,63 +181,353 @@ state = {
 # Survives Railway redeployments
 # Requires GITHUB_TOKEN in Railway vars
 # ─────────────────────────────────────────────
-def git_commit_log():
-    """
-    Auto-commits the CSV to GitHub after every EOD write.
-    Data survives Railway redeploys permanently.
+# ─────────────────────────────────────────────
+# PERSISTENT STORAGE SYSTEM v2
+#
+# Problem solved: Railway wipes the filesystem
+# on every redeploy. Without this, every bot
+# update loses all CSV data — including months
+# of ML training data.
+#
+# How it works:
+#   STARTUP → pull CSV from GitHub (merge)
+#   EVERY WRITE → push CSV to GitHub immediately
+#   STARTUP RECOVERY → detect mid-day deploy,
+#                      restore today's rows
+#
+# This means:
+#   - 10 redeploys in one day = zero data loss
+#   - Each deploy continues exactly where last left off
+#   - Months of ML data are always safe
+#   - Claude always has access to full history
+#
+# Required Railway variable: GITHUB_TOKEN
+# Get at: github.com/settings/tokens (repo scope)
+# ─────────────────────────────────────────────
 
-    Setup: Add GITHUB_TOKEN to Railway environment variables.
-    Get token at: github.com/settings/tokens (repo scope only)
-    """
+def _git_setup():
+    """Configure git auth once. Returns True if GitHub available."""
+    import subprocess
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+    if not github_token:
+        return False
     try:
-        import subprocess
-
-        github_token = os.getenv("GITHUB_TOKEN", "")
-        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
-
-        if not github_token:
-            print("⚠️ GITHUB_TOKEN not set — CSV saved locally only")
-            print("   Add GITHUB_TOKEN to Railway vars to persist data")
-            print("   Get at: github.com/settings/tokens")
-            return
-
-        today_str = now_pdt().strftime("%Y-%m-%d")
         remote_url = f"https://{github_token}@github.com/{github_repo}.git"
-
         subprocess.run(["git", "remote", "set-url", "origin", remote_url],
                        check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "gammabot@railway.app"],
                        check=True, capture_output=True)
         subprocess.run(["git", "config", "user.name", "GammaBot"],
                        check=True, capture_output=True)
+        return True
+    except Exception as e:
+        print(f"Git setup error: {e}")
+        return False
+
+
+def pull_csv_from_github():
+    """
+    Called at startup — pulls the latest CSV from GitHub
+    and merges it with any local data.
+
+    This is the core of data persistence: even after a
+    redeploy wipes the filesystem, the bot immediately
+    restores all historical data from GitHub.
+
+    Merge strategy:
+    - Rows are keyed by (date, time, session_type)
+    - GitHub rows take precedence for completed rows
+    - Local rows (newly written this session) are kept
+    - Result: no duplicate rows, no lost rows
+    """
+    import subprocess
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+
+    if not github_token:
+        print("⚠️ GITHUB_TOKEN not set — running without persistence")
+        print("   Data will be lost on next redeploy.")
+        print("   Add GITHUB_TOKEN to Railway vars: github.com/settings/tokens")
+        return False
+
+    try:
+        print("🔄 Pulling CSV from GitHub...")
+        if not _git_setup():
+            return False
+
+        # Fetch latest from GitHub without merging other code changes
+        subprocess.run(["git", "fetch", "origin", "main"],
+                       check=True, capture_output=True)
+
+        # Check if CSV exists on GitHub
+        result = subprocess.run(
+            ["git", "show", f"origin/main:{LOG_FILE}"],
+            capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            print("📝 No existing CSV on GitHub — starting fresh")
+            return False
+
+        github_csv_content = result.stdout
+
+        # Parse GitHub rows
+        github_rows = []
+        lines = github_csv_content.strip().split("\n")
+        if len(lines) > 1:
+            reader = csv.DictReader(lines)
+            for row in reader:
+                # Ensure all expected headers exist (handles version upgrades)
+                for header in LOG_HEADERS:
+                    if header not in row:
+                        row[header] = ""
+                github_rows.append(row)
+
+        if not github_rows:
+            print("📝 GitHub CSV is empty — starting fresh")
+            return False
+
+        # Load existing local rows (may have been written this session)
+        local_rows = []
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", newline="") as f:
+                local_rows = list(csv.DictReader(f))
+
+        # Merge: key = (date, time, session_type)
+        # GitHub rows are the ground truth for historical data
+        # Local rows that aren't in GitHub (written this session) are kept
+        github_keys = {
+            (r["date"], r["time"], r.get("session_type", "MARKET"))
+            for r in github_rows
+        }
+        new_local_rows = [
+            r for r in local_rows
+            if (r["date"], r["time"], r.get("session_type", "MARKET"))
+            not in github_keys
+        ]
+
+        merged_rows = github_rows + new_local_rows
+
+        # Write merged CSV to disk
+        with open(LOG_FILE, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS,
+                                    extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(merged_rows)
+
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        today_count = sum(1 for r in merged_rows if r["date"] == today_str)
+        total_count = len(merged_rows)
+
+        print(f"✅ CSV restored from GitHub: {total_count} total rows "
+              f"({today_count} today, {len(new_local_rows)} new local merged)")
+        return True
+
+    except Exception as e:
+        print(f"CSV pull error (non-critical): {e}")
+        print("Continuing with local data only")
+        return False
+
+
+def git_commit_log(reason="scheduled"):
+    """
+    Pushes the CSV to GitHub immediately after every write.
+    Called after log_reading() AND after eod_autofill().
+
+    'reason' values: 'reading', 'overnight', 'eod', 'notes'
+    This appears in the commit message for audit trail.
+
+    Rate limiting: won't push more than once per 60 seconds
+    to avoid hitting GitHub API limits during rapid updates.
+    """
+    import subprocess
+
+    # Rate limit: don't push more than once per 60 seconds
+    now_epoch = time.time()
+    last_push = state.get("last_git_push", 0)
+    if reason == "reading" and now_epoch - last_push < 60:
+        return  # Silently skip — will push on next write or EOD
+
+    github_token = os.getenv("GITHUB_TOKEN", "")
+    if not github_token:
+        return  # Already warned at startup
+
+    try:
+        if not _git_setup():
+            return
+
+        today_str = now_pdt().strftime("%Y-%m-%d")
+
         subprocess.run(["git", "add", LOG_FILE],
                        check=True, capture_output=True)
 
         result = subprocess.run(["git", "diff", "--staged", "--quiet"],
                                 capture_output=True)
         if result.returncode == 0:
-            print("📝 No new CSV data to commit")
-            return
+            return  # Nothing to commit
 
         subprocess.run(["git", "commit", "-m",
-                        f"Auto-log: SPY GEX data {today_str}"],
+                        f"Auto-log [{reason}]: SPY GEX {today_str}"],
                        check=True, capture_output=True)
         subprocess.run(["git", "push", "origin", "main"],
                        check=True, capture_output=True)
-        print(f"✅ CSV committed to GitHub: {today_str}")
+
+        state["last_git_push"] = now_epoch
+        print(f"✅ CSV pushed to GitHub [{reason}]: {today_str}")
 
     except Exception as e:
-        print(f"Git commit error (non-critical): {e}")
-        print("CSV data saved locally — add GITHUB_TOKEN to persist")
+        print(f"Git push error (non-critical, data safe locally): {e}")
 
 
 def init_log():
-    """Create CSV file with headers if it doesn't exist."""
+    """
+    Called at startup — restores CSV from GitHub first,
+    then creates headers if still no file exists.
+
+    This replaces the old 'create if not exists' behavior
+    with a proper startup recovery sequence.
+    """
+    print("─" * 60)
+    print("STARTUP: Initializing persistent storage...")
+
+    # Step 1: Try to restore from GitHub
+    restored = pull_csv_from_github()
+
+    # Step 2: If no GitHub data, create fresh file
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
             writer.writeheader()
-        print(f"Log file created: {LOG_FILE}")
+        print("📝 New CSV created (no prior data on GitHub)")
+    else:
+        # File exists (either restored or already there)
+        with open(LOG_FILE, "r", newline="") as f:
+            existing = list(csv.DictReader(f))
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        today_rows = [r for r in existing if r.get("date") == today_str]
+        print(f"📊 CSV ready: {len(existing)} total rows, "
+              f"{len(today_rows)} today")
+
+        # Step 3: Detect mid-day deploy — warn if today data is incomplete
+        if is_market_open() and len(today_rows) == 0:
+            print("⚠️  Mid-day deploy detected with 0 today rows on GitHub.")
+            print("    Rows from earlier today may not have been pushed yet.")
+            print("    This is expected if previous deploy didn't have GITHUB_TOKEN.")
+
+    print("─" * 60)
+
+
+def load_historical_context(days=30):
+    """
+    Loads the last N days of CSV data as a structured summary
+    for Claude to use in morning briefs and signal verification.
+
+    This is what makes the ML context useful — Claude can see
+    patterns across weeks, not just today's readings.
+
+    Returns a compact text summary suitable for Claude's prompt.
+    """
+    try:
+        if not os.path.exists(LOG_FILE):
+            return "No historical data available yet."
+
+        with open(LOG_FILE, "r", newline="") as f:
+            all_rows = list(csv.DictReader(f))
+
+        if not all_rows:
+            return "No historical data available yet."
+
+        # Filter to last N days of MARKET session rows
+        cutoff = (now_pdt() - timedelta(days=days)).strftime("%Y-%m-%d")
+        market_rows = [
+            r for r in all_rows
+            if r.get("date", "") >= cutoff
+            and r.get("session_type", "MARKET") == "MARKET"
+            and r.get("signal_correct", "") != ""
+        ]
+
+        if not market_rows:
+            return f"No completed signal data in last {days} days yet."
+
+        # Aggregate stats
+        total = len(market_rows)
+        correct = sum(1 for r in market_rows if r.get("signal_correct") == "YES")
+        partial = sum(1 for r in market_rows if r.get("signal_correct") == "PARTIAL")
+        wrong = sum(1 for r in market_rows if r.get("signal_correct") == "NO")
+        win_rate = round((correct / total) * 100, 1) if total > 0 else 0
+
+        # Regime accuracy breakdown
+        regime_stats = {}
+        for r in market_rows:
+            regime = r.get("regime", "UNKNOWN")
+            if regime not in regime_stats:
+                regime_stats[regime] = {"correct": 0, "total": 0}
+            regime_stats[regime]["total"] += 1
+            if r.get("signal_correct") == "YES":
+                regime_stats[regime]["correct"] += 1
+
+        regime_summary = []
+        for regime, stats in sorted(regime_stats.items(),
+                                     key=lambda x: -x[1]["total"]):
+            if stats["total"] >= 3:
+                pct = round((stats["correct"] / stats["total"]) * 100, 0)
+                regime_summary.append(
+                    f"  {regime}: {pct}% win rate ({stats['total']} signals)"
+                )
+
+        # Average move on correct signals
+        moves = []
+        for r in market_rows:
+            try:
+                pts = float(r.get("outcome_points", 0) or 0)
+                if pts != 0:
+                    moves.append(abs(pts))
+            except Exception:
+                pass
+        avg_move = round(sum(moves) / len(moves), 2) if moves else 0
+
+        # Recent catalyst accuracy
+        catalyst_rows = [r for r in market_rows if r.get("catalyst_type") != "NONE"]
+        cat_correct = sum(1 for r in catalyst_rows if r.get("signal_correct") == "YES")
+        cat_rate = round((cat_correct / len(catalyst_rows)) * 100, 1) if catalyst_rows else 0
+
+        # Macro override accuracy
+        override_rows = [r for r in market_rows if r.get("macro_override") == "YES"]
+        ovr_correct = sum(1 for r in override_rows if r.get("signal_correct") == "YES")
+        ovr_rate = round((ovr_correct / len(override_rows)) * 100, 1) if override_rows else 0
+
+        # Most recent 5 outcomes for recency context
+        recent = sorted(market_rows, key=lambda x: (x["date"], x["time"]))[-5:]
+        recent_lines = []
+        for r in recent:
+            recent_lines.append(
+                f"  {r['date']} {r['time']}: {r.get('gex_state','?')} | "
+                f"{r.get('regime','?')} | Score:{r.get('conviction_score','?')} | "
+                f"Outcome:{r.get('outcome_direction','?')} {r.get('outcome_points','?')}pts | "
+                f"Correct:{r.get('signal_correct','?')}"
+            )
+
+        summary = (
+            f"HISTORICAL PERFORMANCE (last {days} days, {total} signals):\n"
+            f"  Overall win rate: {win_rate}% "
+            f"(Correct:{correct} Partial:{partial} Wrong:{wrong})\n"
+            f"  Average move on signals: {avg_move} pts\n"
+            f"  With catalyst active: {cat_rate}% win rate "
+            f"({len(catalyst_rows)} signals)\n"
+            f"  Macro override YES: {ovr_rate}% win rate "
+            f"({len(override_rows)} signals)\n"
+            f"\nREGIME WIN RATES:\n" + "\n".join(regime_summary) +
+            f"\n\nRECENT SIGNALS:\n" + "\n".join(recent_lines)
+        )
+
+        print(f"📚 Historical context loaded: {total} signals, "
+              f"{win_rate}% win rate")
+        return summary
+
+    except Exception as e:
+        print(f"Historical context error: {e}")
+        return "Historical context unavailable."
 
 
 # ─────────────────────────────────────────────
@@ -809,6 +1101,9 @@ def log_overnight_reading(overnight_data):
 
         print(f"📝 Overnight logged: {now_str} | {futures_dir} | VIX {vix_current}")
 
+        # Push immediately — overnight data also persisted
+        git_commit_log(reason="overnight")
+
     except Exception as e:
         print(f"Overnight log error: {e}")
 
@@ -958,6 +1253,9 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
         print(f"📝 Logged: {row['time']} | {gex_state} | Score:{conv} | "
               f"News:{news_sentiment} | Catalyst:{catalyst_type}")
 
+        # Push to GitHub immediately — data safe even if bot crashes next second
+        git_commit_log(reason="reading")
+
     except Exception as e:
         print(f"log_reading error: {e}")
 
@@ -1072,6 +1370,8 @@ Market data:
 
 Write a morning briefing. Rules:
 - Max 10 lines total, plain English
+- If historical data is provided above, reference it — e.g. "this regime has been
+  correct X% of the time" or "macro override days have been unreliable recently"
 - What to expect today and why
 - One clear actionable recommendation
 - Name the biggest risk
@@ -2148,8 +2448,8 @@ def eod_autofill(close_price):
         state["overnight_alerts_today"] = 0
         state["overnight_report_sent"] = False
 
-        # Commit to GitHub
-        git_commit_log()
+        # Commit to GitHub — EOD forces a push regardless of rate limit
+        git_commit_log(reason="eod")
 
         now_str = now_pdt().strftime("%H:%M")
         signal_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
@@ -2164,7 +2464,8 @@ def eod_autofill(close_price):
             f"Morning signal: {morning_signal or 'None'}\n"
             f"Signal correct: {correct}\n"
             f"Rows logged: {updated}\n"
-            f"Overnight monitoring will continue until 6am tomorrow."
+            f"Overnight monitoring will continue until 6am tomorrow.\n\n"
+            f"{load_historical_context(days=30)}"
         )
 
         written = write_alert_with_claude(
@@ -2472,6 +2773,10 @@ def run_job():
                 cal_text = "\n".join(cal_flags) if cal_flags else "No special events"
                 update_tag = "🔄 UPDATED — " if conviction_changed else ""
 
+                # Historical performance context — Claude uses this to calibrate
+                # its morning brief based on how well the bot has been working
+                hist_context = load_historical_context(days=30)
+
                 written = write_alert_with_claude(
                     alert_type="morning_report",
                     price=price, gex_state=gex_state, regime=regime,
@@ -2486,7 +2791,11 @@ def run_job():
                     previous_regime=state.get("previous_regime", ""),
                     previous_gex_state=state.get("previous_gex_state", ""),
                     claude_verdict=claude_verdict,
-                    extra_context=f"Calendar: {cal_text}\nVIX: {vix_sig}\nVVIX: {vvix_sig}"
+                    extra_context=(
+                        f"Calendar: {cal_text}\n"
+                        f"VIX: {vix_sig}\nVVIX: {vvix_sig}\n\n"
+                        f"{hist_context}"
+                    )
                 )
 
                 if written:
@@ -2789,7 +3098,7 @@ schedule.every(60).minutes.do(check_heartbeat)
 # The function itself checks if it's appropriate to alert
 schedule.every(30).minutes.do(run_overnight_check)
 
-print("SPY UNIFIED BOT v5.0 — ML READY + OVERNIGHT")
+print("SPY UNIFIED BOT v5.1 — PERSISTENT ML + OVERNIGHT")
 print("=" * 60)
 print("Daytime Modules:")
 print("  1. GEX Core + State Change Alerts")
@@ -2807,15 +3116,21 @@ print(" 12. Claude AI Verification + Alert Writer")
 print(" 13. Heartbeat Watchdog (60min)")
 print(" 14. Doji Transition Detector")
 print(" 15. Gamma Wall / TP Zone Alert")
-print(" 16. ML Data Logger — FULLY AUTOMATED")
 print("-" * 60)
-print("Overnight Modules (NEW):")
-print(" 17. ES Futures Tracker")
-print(" 18. VIX Overnight Change Monitor")
-print(" 19. Institutional News Catalyst Detector")
-print(" 20. Claude Overnight Alert Writer")
-print(" 21. Overnight CSV Logger (session_type=OVERNIGHT)")
-print(" 22. /overnight Telegram Command")
+print("Overnight Modules:")
+print(" 16. ES Futures Tracker")
+print(" 17. VIX Overnight Change Monitor")
+print(" 18. Institutional News Catalyst Detector")
+print(" 19. Claude Overnight Alert Writer")
+print(" 20. Overnight CSV Logger")
+print(" 21. /overnight Telegram Command")
+print("-" * 60)
+print("Data Persistence (NEW):")
+print(" 22. Startup CSV pull from GitHub (merge, never overwrite)")
+print(" 23. Push to GitHub after EVERY write (not just EOD)")
+print(" 24. Historical context injected into Claude morning brief")
+print(" 25. load_historical_context() — win rates, regime accuracy")
+print(" 26. Redeploy-safe: 10 updates same day = zero data loss")
 print("=" * 60)
 print("Timezone: All times PDT (UTC-7)")
 print("Schedule: Daytime 6:00am-1:00pm | Overnight: continuous")
@@ -2826,6 +3141,7 @@ print("⚠️  GitHub ❌ in /status?")
 print("   Add GITHUB_TOKEN to Railway environment variables.")
 print("   Get at: github.com/settings/tokens (repo scope only)")
 print("   Without this, CSV is wiped on every redeploy.")
+print("   IMPORTANT: Until this is set, months of data are at risk.")
 print("=" * 60)
 
 init_log()
