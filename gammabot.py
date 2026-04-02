@@ -164,6 +164,7 @@ state = {
     "eod_fired_today": False,
     # Persistence tracking
     "last_git_push": 0,
+    "github_csv_sha": "",   # SHA cached from GitHub — needed for API updates
     # Overnight state — new
     "overnight_report_sent": False,
     "last_overnight_check": 0,
@@ -205,80 +206,82 @@ state = {
 # Get at: github.com/settings/tokens (repo scope)
 # ─────────────────────────────────────────────
 
-def _git_setup():
-    """Configure git auth once. Returns True if GitHub available."""
-    import subprocess
-    github_token = os.getenv("GITHUB_TOKEN", "")
-    github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
-    if not github_token:
-        return False
-    try:
-        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
-        subprocess.run(["git", "remote", "set-url", "origin", remote_url],
-                       check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.email", "gammabot@railway.app"],
-                       check=True, capture_output=True)
-        subprocess.run(["git", "config", "user.name", "GammaBot"],
-                       check=True, capture_output=True)
-        return True
-    except Exception as e:
-        print(f"Git setup error: {e}")
-        return False
+# ─────────────────────────────────────────────
+# GITHUB API HELPERS
+# Pure HTTP — no git binary required.
+# Railway containers don't have git installed,
+# so we use GitHub's REST API directly via
+# the requests library (already imported).
+# ─────────────────────────────────────────────
+
+def _github_headers():
+    """Return auth headers for GitHub API calls."""
+    token = os.getenv("GITHUB_TOKEN", "")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+    }
+
+def _github_repo():
+    return os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+
+def _github_available():
+    return bool(os.getenv("GITHUB_TOKEN", ""))
 
 
 def pull_csv_from_github():
     """
-    Called at startup — pulls the latest CSV from GitHub
-    and merges it with any local data.
+    Called at startup — downloads the CSV from GitHub via REST API
+    and merges it with any local data already on disk.
 
-    This is the core of data persistence: even after a
-    redeploy wipes the filesystem, the bot immediately
-    restores all historical data from GitHub.
+    Uses GET /repos/{owner}/{repo}/contents/{path}
+    No git binary needed — pure HTTP request.
 
     Merge strategy:
-    - Rows are keyed by (date, time, session_type)
-    - GitHub rows take precedence for completed rows
-    - Local rows (newly written this session) are kept
-    - Result: no duplicate rows, no lost rows
+    - Rows keyed by (date, time, session_type)
+    - GitHub rows = ground truth for historical data
+    - Local rows not on GitHub (written this session) = kept
+    - Result: no duplicates, no lost rows
+    - Version safe: missing columns filled with "" automatically
     """
-    import subprocess
-    github_token = os.getenv("GITHUB_TOKEN", "")
-    github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
-
-    if not github_token:
+    if not _github_available():
         print("⚠️ GITHUB_TOKEN not set — running without persistence")
         print("   Data will be lost on next redeploy.")
         print("   Add GITHUB_TOKEN to Railway vars: github.com/settings/tokens")
         return False
 
     try:
-        print("🔄 Pulling CSV from GitHub...")
-        if not _git_setup():
-            return False
+        print("🔄 Pulling CSV from GitHub API...")
+        repo = _github_repo()
+        url = f"https://api.github.com/repos/{repo}/contents/{LOG_FILE}"
 
-        # Fetch latest from GitHub without merging other code changes
-        subprocess.run(["git", "fetch", "origin", "main"],
-                       check=True, capture_output=True)
+        resp = requests.get(url, headers=_github_headers(), timeout=15)
 
-        # Check if CSV exists on GitHub
-        result = subprocess.run(
-            ["git", "show", f"origin/main:{LOG_FILE}"],
-            capture_output=True, text=True
-        )
-
-        if result.returncode != 0:
+        if resp.status_code == 404:
             print("📝 No existing CSV on GitHub — starting fresh")
             return False
 
-        github_csv_content = result.stdout
+        if resp.status_code != 200:
+            print(f"⚠️ GitHub API error {resp.status_code} — starting fresh")
+            return False
+
+        data = resp.json()
+
+        # GitHub returns file content as base64
+        import base64
+        raw_content = base64.b64decode(data["content"]).decode("utf-8")
+
+        # Store SHA — needed for the update (push) call later
+        state["github_csv_sha"] = data.get("sha", "")
 
         # Parse GitHub rows
         github_rows = []
-        lines = github_csv_content.strip().split("\n")
+        lines = raw_content.strip().split("\n")
         if len(lines) > 1:
             reader = csv.DictReader(lines)
             for row in reader:
-                # Ensure all expected headers exist (handles version upgrades)
+                # Fill any missing columns (handles version upgrades safely)
                 for header in LOG_HEADERS:
                     if header not in row:
                         row[header] = ""
@@ -288,15 +291,13 @@ def pull_csv_from_github():
             print("📝 GitHub CSV is empty — starting fresh")
             return False
 
-        # Load existing local rows (may have been written this session)
+        # Load any rows already written locally this session
         local_rows = []
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "r", newline="") as f:
                 local_rows = list(csv.DictReader(f))
 
-        # Merge: key = (date, time, session_type)
-        # GitHub rows are the ground truth for historical data
-        # Local rows that aren't in GitHub (written this session) are kept
+        # Merge: GitHub is source of truth, keep local rows not yet pushed
         github_keys = {
             (r["date"], r["time"], r.get("session_type", "MARKET"))
             for r in github_rows
@@ -306,7 +307,6 @@ def pull_csv_from_github():
             if (r["date"], r["time"], r.get("session_type", "MARKET"))
             not in github_keys
         ]
-
         merged_rows = github_rows + new_local_rows
 
         # Write merged CSV to disk
@@ -320,7 +320,7 @@ def pull_csv_from_github():
         today_count = sum(1 for r in merged_rows if r["date"] == today_str)
         total_count = len(merged_rows)
 
-        print(f"✅ CSV restored from GitHub: {total_count} total rows "
+        print(f"✅ CSV restored: {total_count} total rows "
               f"({today_count} today, {len(new_local_rows)} new local merged)")
         return True
 
@@ -332,52 +332,71 @@ def pull_csv_from_github():
 
 def git_commit_log(reason="scheduled"):
     """
-    Pushes the CSV to GitHub immediately after every write.
-    Called after log_reading() AND after eod_autofill().
+    Pushes the CSV to GitHub via REST API after every write.
+    Uses PUT /repos/{owner}/{repo}/contents/{path}
 
-    'reason' values: 'reading', 'overnight', 'eod', 'notes'
-    This appears in the commit message for audit trail.
-
-    Rate limiting: won't push more than once per 60 seconds
-    to avoid hitting GitHub API limits during rapid updates.
+    No git binary needed — pure HTTP.
+    Rate limited to once per 60s for 'reading' calls
+    to avoid GitHub API limits. EOD always pushes.
     """
-    import subprocess
+    import base64
 
-    # Rate limit: don't push more than once per 60 seconds
+    # Rate limit for high-frequency reading calls
     now_epoch = time.time()
     last_push = state.get("last_git_push", 0)
     if reason == "reading" and now_epoch - last_push < 60:
-        return  # Silently skip — will push on next write or EOD
+        return  # Will push on next write or EOD
 
-    github_token = os.getenv("GITHUB_TOKEN", "")
-    if not github_token:
+    if not _github_available():
         return  # Already warned at startup
 
-    try:
-        if not _git_setup():
-            return
+    if not os.path.exists(LOG_FILE):
+        return
 
+    try:
+        repo = _github_repo()
         today_str = now_pdt().strftime("%Y-%m-%d")
 
-        subprocess.run(["git", "add", LOG_FILE],
-                       check=True, capture_output=True)
+        # Read current CSV content
+        with open(LOG_FILE, "rb") as f:
+            content_bytes = f.read()
+        encoded = base64.b64encode(content_bytes).decode("utf-8")
 
-        result = subprocess.run(["git", "diff", "--staged", "--quiet"],
-                                capture_output=True)
-        if result.returncode == 0:
-            return  # Nothing to commit
+        # Get current SHA from GitHub (needed for update)
+        # Use cached SHA if available, otherwise fetch it
+        sha = state.get("github_csv_sha", "")
+        if not sha:
+            url = f"https://api.github.com/repos/{repo}/contents/{LOG_FILE}"
+            r = requests.get(url, headers=_github_headers(), timeout=10)
+            if r.status_code == 200:
+                sha = r.json().get("sha", "")
+            # If 404, file doesn't exist yet — first push, sha stays ""
 
-        subprocess.run(["git", "commit", "-m",
-                        f"Auto-log [{reason}]: SPY GEX {today_str}"],
-                       check=True, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"],
-                       check=True, capture_output=True)
+        # PUT request — creates or updates the file
+        url = f"https://api.github.com/repos/{repo}/contents/{LOG_FILE}"
+        payload = {
+            "message": f"Auto-log [{reason}]: SPY GEX {today_str}",
+            "content": encoded,
+            "branch": "main",
+        }
+        if sha:
+            payload["sha"] = sha  # Required for updates, omit for first create
 
-        state["last_git_push"] = now_epoch
-        print(f"✅ CSV pushed to GitHub [{reason}]: {today_str}")
+        resp = requests.put(url, headers=_github_headers(),
+                            json=payload, timeout=20)
+
+        if resp.status_code in (200, 201):
+            # Cache the new SHA for the next update
+            new_sha = resp.json().get("content", {}).get("sha", "")
+            if new_sha:
+                state["github_csv_sha"] = new_sha
+            state["last_git_push"] = now_epoch
+            print(f"✅ CSV pushed to GitHub [{reason}]: {today_str}")
+        else:
+            print(f"⚠️ GitHub push failed {resp.status_code}: {resp.text[:100]}")
 
     except Exception as e:
-        print(f"Git push error (non-critical, data safe locally): {e}")
+        print(f"GitHub push error (non-critical, data safe locally): {e}")
 
 
 def init_log():
