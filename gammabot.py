@@ -13,10 +13,11 @@ from telegram import Bot
 load_dotenv()
 
 # ─────────────────────────────────────────────
-# LOGGING SYSTEM
-# Records every reading to CSV for future
-# pattern analysis and ML training data
+# LOGGING SYSTEM v2 — Full ML Dataset
+# Everything logged automatically
+# Only "notes" column is optional for you
 # ─────────────────────────────────────────────
+
 LOG_FILE = "spy_gex_log.csv"
 LOG_HEADERS = [
     "date", "time", "price",
@@ -29,11 +30,253 @@ LOG_HEADERS = [
     "unwind_score", "open_drive",
     "vanna_target", "charm_target",
     "calendar_flags", "days_to_opex",
-    "outcome_direction",   # filled manually: UP / DOWN / CHOP
-    "outcome_points",      # filled manually: e.g. +8.5 or -3.2
-    "signal_correct",      # filled manually: YES / NO / PARTIAL
-    "notes"                # filled manually: any context
+    # Intraday ML features — all auto
+    "vwap_distance",
+    "price_vs_open",
+    "session_range",
+    "vol_gex_velocity",
+    "vol_gex_direction",
+    "regime_transitions",
+    "vwap_breaks",
+    "gamma_wall_above",
+    "gamma_wall_below",
+    "time_of_day",
+    # Catalyst ML features — all auto
+    "news_sentiment",
+    "news_score",
+    "catalyst_type",
+    "catalyst_strength",
+    "macro_override",
+    # Outcomes — all auto at EOD
+    "outcome_direction",
+    "outcome_points",
+    "signal_correct",
+    "max_move_up",
+    "max_move_down",
+    # Only this needs you — optional
+    "notes"
 ]
+
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+
+# Known economic event calendar
+FED_DATES_2026 = [
+    date(2026, 1, 29), date(2026, 3, 19),
+    date(2026, 5, 7),  date(2026, 6, 18),
+    date(2026, 7, 30), date(2026, 9, 17),
+    date(2026, 11, 5), date(2026, 12, 16),
+]
+
+def fetch_news_sentiment():
+    """
+    Pulls latest SPY/market headlines from NewsAPI.
+    Scores sentiment automatically.
+    Returns: sentiment, score, catalyst_type, strength, macro_override
+    """
+    try:
+        if not NEWS_API_KEY:
+            return "NEUTRAL", 50, "NONE", 0, "NO"
+
+        url = (
+            f"https://newsapi.org/v2/everything?"
+            f"q=SPY+OR+S%26P500+OR+Federal+Reserve+OR+tariff+OR+Iran"
+            f"&language=en&sortBy=publishedAt&pageSize=10"
+            f"&apiKey={NEWS_API_KEY}"
+        )
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return "NEUTRAL", 50, "NONE", 0, "NO"
+
+        articles = r.json().get("articles", [])
+        if not articles:
+            return "NEUTRAL", 50, "NONE", 0, "NO"
+
+        # Keyword scoring
+        bullish_words = [
+            "rally", "surge", "gain", "rise", "jump", "soar",
+            "ceasefire", "deal", "peace", "cut rates", "stimulus",
+            "beat", "strong", "record high", "recovery", "easing"
+        ]
+        bearish_words = [
+            "crash", "drop", "fall", "plunge", "tariff", "war",
+            "recession", "inflation", "hike rates", "sell-off",
+            "miss", "weak", "concern", "fear", "risk", "sanctions"
+        ]
+        geo_words = ["iran", "war", "strait", "hormuz", "military",
+                     "attack", "strike", "nato", "conflict", "missile"]
+        fed_words = ["federal reserve", "fed", "powell", "rate", "fomc",
+                     "interest rate", "monetary policy"]
+        tariff_words = ["tariff", "trade war", "import tax", "liberation day",
+                        "trade deal", "sanctions", "export"]
+
+        bull_score = 0
+        bear_score = 0
+        geo_count = 0
+        fed_count = 0
+        tariff_count = 0
+
+        for article in articles[:10]:
+            text = (
+                (article.get("title") or "") + " " +
+                (article.get("description") or "")
+            ).lower()
+
+            for w in bullish_words:
+                if w in text:
+                    bull_score += 1
+            for w in bearish_words:
+                if w in text:
+                    bear_score += 1
+            for w in geo_words:
+                if w in text:
+                    geo_count += 1
+            for w in fed_words:
+                if w in text:
+                    fed_count += 1
+            for w in tariff_words:
+                if w in text:
+                    tariff_count += 1
+
+        # Determine catalyst type
+        today = date.today()
+        if today in FED_DATES_2026 or fed_count >= 3:
+            catalyst_type = "FED"
+            catalyst_strength = min(100, fed_count * 15 + 40)
+        elif geo_count >= 3:
+            catalyst_type = "GEO"
+            catalyst_strength = min(100, geo_count * 12 + 30)
+        elif tariff_count >= 3:
+            catalyst_type = "TARIFF"
+            catalyst_strength = min(100, tariff_count * 12 + 30)
+        elif today in OPEX_DATES:
+            catalyst_type = "OPEX"
+            catalyst_strength = 60
+        else:
+            catalyst_type = "NONE"
+            catalyst_strength = 0
+
+        # Determine sentiment
+        total = bull_score + bear_score
+        if total == 0:
+            sentiment = "NEUTRAL"
+            news_score = 50
+        elif bull_score > bear_score * 1.5:
+            sentiment = "BULLISH"
+            news_score = min(100, int(50 + (bull_score / total) * 50))
+        elif bear_score > bull_score * 1.5:
+            sentiment = "BEARISH"
+            news_score = max(0, int(50 - (bear_score / total) * 50))
+        else:
+            sentiment = "NEUTRAL"
+            news_score = 50
+
+        # Macro override — news likely beats structure signal
+        macro_override = "YES" if (
+            catalyst_strength >= 60 or
+            geo_count >= 5 or
+            (catalyst_type == "FED" and catalyst_strength >= 50)
+        ) else "NO"
+
+        return sentiment, news_score, catalyst_type, catalyst_strength, macro_override
+
+    except Exception as e:
+        print(f"News sentiment error: {e}")
+        return "NEUTRAL", 50, "NONE", 0, "NO"
+
+
+def get_intraday_features(price, vol_gex):
+    """
+    Calculates intraday ML features automatically from session state.
+    No manual input required.
+    """
+    try:
+        # VWAP distance
+        vwap = state.get("session_vwap")
+        vwap_distance = round(price - vwap, 2) if vwap else 0
+
+        # Price vs open
+        open_price = state.get("open_price")
+        price_vs_open = round(price - open_price, 2) if open_price else 0
+
+        # Session range
+        session_high = state.get("session_high") or price
+        session_low = state.get("session_low") or price
+        session_high = max(session_high, price)
+        session_low = min(session_low, price)
+        state["session_high"] = session_high
+        state["session_low"] = session_low
+        session_range = round(session_high - session_low, 2)
+
+        # Vol GEX velocity
+        history = state.get("vol_gex_history", [])
+        if len(history) >= 2:
+            velocity = round(vol_gex - history[-2], 4)
+            vol_gex_direction = (
+                "ACCELERATING" if abs(vol_gex) > abs(history[-2])
+                else "DECELERATING"
+            )
+        else:
+            velocity = 0
+            vol_gex_direction = "STABLE"
+
+        # Regime transitions today
+        regime_transitions = state.get("regime_transitions_today", 0)
+
+        # VWAP breaks today
+        vwap_breaks = state.get("vwap_breaks_today", 0)
+
+        # Gamma walls (simple approximation from OI concentration)
+        gamma_wall_above = state.get("gamma_wall_above", "")
+        gamma_wall_below = state.get("gamma_wall_below", "")
+
+        # Time of day
+        h = datetime.now().hour
+        if h < 8:
+            time_of_day = "EARLY"
+        elif h < 11:
+            time_of_day = "MID"
+        else:
+            time_of_day = "LATE"
+
+        return {
+            "vwap_distance": vwap_distance,
+            "price_vs_open": price_vs_open,
+            "session_range": session_range,
+            "vol_gex_velocity": velocity,
+            "vol_gex_direction": vol_gex_direction,
+            "regime_transitions": regime_transitions,
+            "vwap_breaks": vwap_breaks,
+            "gamma_wall_above": gamma_wall_above,
+            "gamma_wall_below": gamma_wall_below,
+            "time_of_day": time_of_day,
+        }
+    except Exception as e:
+        print(f"Intraday features error: {e}")
+        return {k: "" for k in [
+            "vwap_distance", "price_vs_open", "session_range",
+            "vol_gex_velocity", "vol_gex_direction", "regime_transitions",
+            "vwap_breaks", "gamma_wall_above", "gamma_wall_below", "time_of_day"
+        ]}
+
+
+def git_commit_log():
+    """
+    Auto-commits the CSV to GitHub after every EOD write.
+    Data survives Railway redeploys permanently.
+    """
+    try:
+        import subprocess
+        subprocess.run(["git", "add", LOG_FILE], check=True)
+        today_str = date.today().strftime("%Y-%m-%d")
+        subprocess.run([
+            "git", "commit", "-m",
+            f"Auto-log: SPY GEX data {today_str}"
+        ], check=True)
+        subprocess.run(["git", "push", "origin", "main"], check=True)
+        print(f"✅ CSV committed to GitHub: {today_str}")
+    except Exception as e:
+        print(f"Git commit error (non-critical): {e}")
+
 
 def init_log():
     """Create CSV file with headers if it doesn't exist."""
@@ -48,51 +291,85 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
                 tick_approx, inventory_bias, unwind_score, open_drive,
                 vanna_target, charm_target, cal_flags, days_opex):
     """
-    Appends one row per bot reading to the CSV log.
-    Outcome columns are left blank — you fill those in manually
-    at end of day using the journal process.
+    Fully automated logging — no manual input required.
+    Fetches news sentiment, calculates intraday features,
+    and writes complete ML-ready row to CSV.
     """
-    now = datetime.now()
-    cal_summary = "QUARTER_END" if "QUARTER END TODAY" in str(cal_flags) else (
-                  "OPEX_DAY" if "OPEX DAY" in str(cal_flags) else
-                  f"OPEX_IN_{days_opex}D" if days_opex else "NORMAL")
+    try:
+        now = datetime.now()
+        cal_summary = (
+            "QUARTER_END" if "QUARTER END TODAY" in str(cal_flags) else
+            "OPEX_DAY" if "OPEX DAY" in str(cal_flags) else
+            f"OPEX_IN_{days_opex}D" if days_opex else "NORMAL"
+        )
 
-    row = {
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M"),
-        "price": round(price, 2),
-        "oi_gex_raw": round(oi_gex / 1e9, 4),
-        "vol_gex_raw": round(vol_gex / 1e9, 4),
-        "oi_gex_m": round(oi_m, 2),
-        "vol_gex_m": round(vol_m, 2),
-        "ratio": round(ratio, 2),
-        "gex_state": gex_state,
-        "regime": regime,
-        "conviction_score": conv,
-        "grade": grade.replace("🔥","").replace("✅","").replace("⚠️","").replace("🔴","").replace("❌","").strip(),
-        "vix": round(vix_spot, 2) if vix_spot else "",
-        "vvix": round(vvix_val, 2) if vvix_val else "",
-        "vix_term": vix_term or "",
-        "tick_approx": tick_approx,
-        "inventory_bias": inventory_bias,
-        "unwind_score": unwind_score,
-        "open_drive": "YES" if open_drive else "NO",
-        "vanna_target": vanna_target or "",
-        "charm_target": charm_target or "",
-        "calendar_flags": cal_summary,
-        "days_to_opex": days_opex or "",
-        # Outcome columns — fill manually at end of day
-        "outcome_direction": "",
-        "outcome_points": "",
-        "signal_correct": "",
-        "notes": ""
-    }
+        # Fetch all automated features
+        intraday = get_intraday_features(price, vol_gex)
+        news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = fetch_news_sentiment()
 
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
-        writer.writerow(row)
+        clean_grade = grade.replace("🔥","").replace("✅","").replace("⚠️","").replace("🔴","").replace("❌","").strip()
 
-    print(f"📝 Logged reading at {row['time']} | {gex_state} | Score:{conv} | Ratio:{ratio:.2f}x")
+        row = {
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M"),
+            "price": round(price, 2),
+            "oi_gex_raw": round(oi_gex / 1e9, 4),
+            "vol_gex_raw": round(vol_gex / 1e9, 4),
+            "oi_gex_m": round(oi_m, 2),
+            "vol_gex_m": round(vol_m, 2),
+            "ratio": round(ratio, 2),
+            "gex_state": gex_state,
+            "regime": regime,
+            "conviction_score": conv,
+            "grade": clean_grade,
+            "vix": round(vix_spot, 2) if vix_spot else "",
+            "vvix": round(vvix_val, 2) if vvix_val else "",
+            "vix_term": vix_term or "",
+            "tick_approx": tick_approx,
+            "inventory_bias": inventory_bias,
+            "unwind_score": unwind_score,
+            "open_drive": "YES" if open_drive else "NO",
+            "vanna_target": vanna_target or "",
+            "charm_target": charm_target or "",
+            "calendar_flags": cal_summary,
+            "days_to_opex": days_opex or "",
+            # Intraday features — all auto
+            "vwap_distance": intraday["vwap_distance"],
+            "price_vs_open": intraday["price_vs_open"],
+            "session_range": intraday["session_range"],
+            "vol_gex_velocity": intraday["vol_gex_velocity"],
+            "vol_gex_direction": intraday["vol_gex_direction"],
+            "regime_transitions": intraday["regime_transitions"],
+            "vwap_breaks": intraday["vwap_breaks"],
+            "gamma_wall_above": intraday["gamma_wall_above"],
+            "gamma_wall_below": intraday["gamma_wall_below"],
+            "time_of_day": intraday["time_of_day"],
+            # Catalyst features — all auto
+            "news_sentiment": news_sentiment,
+            "news_score": news_score,
+            "catalyst_type": catalyst_type,
+            "catalyst_strength": catalyst_strength,
+            "macro_override": macro_override,
+            # Outcomes — filled by EOD autofill
+            "outcome_direction": "",
+            "outcome_points": "",
+            "signal_correct": "",
+            "max_move_up": "",
+            "max_move_down": "",
+            # Only optional field for you
+            "notes": ""
+        }
+
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+            writer.writerow(row)
+
+        print(f"📝 Logged: {row['time']} | {gex_state} | Score:{conv} | "
+              f"News:{news_sentiment} | Catalyst:{catalyst_type} | "
+              f"MacroOverride:{macro_override}")
+
+    except Exception as e:
+        print(f"log_reading error: {e}")
 
 UW_TOKEN = os.getenv("UW_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -1105,6 +1382,8 @@ def eod_autofill(close_price):
                 r["outcome_direction"] = direction
                 r["outcome_points"] = point_move
                 r["signal_correct"] = correct
+                r["max_move_up"] = round(session_high - open_price, 2) if session_high else ""
+                r["max_move_down"] = round(open_price - session_low, 2) if session_low else ""
                 updated += 1
 
         # Write back to CSV
@@ -1113,26 +1392,35 @@ def eod_autofill(close_price):
             writer.writeheader()
             writer.writerows(rows)
 
+        # Auto-commit to GitHub — data survives redeployments
+        git_commit_log()
+
         # Send end of day summary to Telegram
         now_str = datetime.now().strftime("%H:%M")
         signal_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
+        session_high = state.get("session_high") or close_price
+        session_low = state.get("session_low") or close_price
+        max_up = round(session_high - open_price, 2)
+        max_down = round(open_price - session_low, 2)
 
         alert(
             f"📊 END OF DAY SUMMARY — SPY\n"
             f"{'─'*35}\n"
-            f"Date: {today_str} | Time: {now_str}\n\n"
-            f"Open: ${round(open_price, 2)}\n"
+            f"Date: {today_str} | {now_str}\n\n"
+            f"Open:  ${round(open_price, 2)}\n"
             f"Close: ${round(close_price, 2)}\n"
-            f"Move: {'+' if point_move > 0 else ''}{point_move} pts\n"
-            f"Direction: {direction}\n\n"
-            f"Morning Signal: {morning_signal or 'None'}\n"
-            f"Signal Correct: {signal_emoji} {correct}\n\n"
-            f"📝 {updated} log rows updated automatically\n"
-            f"→ Open spy_gex_log.csv to add notes column\n"
-            f"   (e.g. Iran news, Fed day, OPEX expiry)"
+            f"Move:  {'+' if point_move > 0 else ''}{point_move} pts\n"
+            f"Direction: {direction}\n"
+            f"Max Up: +{max_up} | Max Down: -{max_down}\n\n"
+            f"Signal: {morning_signal or 'None'}\n"
+            f"Correct: {signal_emoji} {correct}\n\n"
+            f"📝 {updated} rows logged automatically\n"
+            f"💾 CSV saved to GitHub\n\n"
+            f"💬 Add context? Reply:\n"
+            f"/notes Iran news drove the gap"
         )
 
-        print(f"EOD autofill complete — {updated} rows updated | {direction} {point_move}pts | Correct: {correct}")
+        print(f"EOD complete — {updated} rows | {direction} {point_move}pts | {correct}")
 
     except Exception as e:
         print(f"EOD autofill error: {e}")
@@ -1422,6 +1710,11 @@ def run_job():
             state["open_volume"] = None
             state["open_drive_detected"] = False
             state["tick_history"] = []
+            state["session_high"] = None
+            state["session_low"] = None
+            state["regime_transitions_today"] = 0
+            state["vwap_breaks_today"] = 0
+            state["session_vwap"] = None
 
         # Update state
         state["previous_gex_state"] = gex_state
@@ -1435,6 +1728,72 @@ def run_job():
         print(f"run_job error: {e}")
         import traceback
         traceback.print_exc()
+
+
+# ─────────────────────────────────────────────
+# TELEGRAM /notes COMMAND
+# Only manual input needed — add context
+# to today's log rows via Telegram message
+# Usage: /notes Iran news drove the gap
+# ─────────────────────────────────────────────
+async def handle_telegram_updates():
+    """
+    Polls Telegram for /notes commands.
+    Writes the note to today's CSV rows.
+    Run every 5 minutes during market hours.
+    """
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        updates = await bot.get_updates(timeout=5)
+        today_str = date.today().strftime("%Y-%m-%d")
+
+        for update in updates:
+            if not update.message:
+                continue
+            text = update.message.text or ""
+            if not text.startswith("/notes "):
+                continue
+
+            note = text[7:].strip()
+            if not note:
+                continue
+
+            # Write note to today's rows
+            if not os.path.exists(LOG_FILE):
+                continue
+
+            rows = []
+            with open(LOG_FILE, "r", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+
+            updated = 0
+            for r in rows:
+                if r["date"] == today_str:
+                    r["notes"] = note
+                    updated += 1
+
+            with open(LOG_FILE, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=(
+                    f"✅ Note saved to {updated} rows\n"
+                    f"Date: {today_str}\n"
+                    f"Note: {note}"
+                )
+            )
+            print(f"Note saved: {note}")
+
+    except Exception as e:
+        print(f"Telegram command error: {e}")
+
+
+def check_telegram_commands():
+    asyncio.run(handle_telegram_updates())
 
 
 # ─────────────────────────────────────────────
@@ -1454,14 +1813,14 @@ schedule.every().day.at("13:00").do(run_job)
 
 schedule.every(5).minutes.do(check_vwap)
 schedule.every(5).minutes.do(check_consolidation_job)
+schedule.every(5).minutes.do(check_telegram_commands)
 
-print("SPY UNIFIED BOT v3.0")
+print("SPY UNIFIED BOT v4.0 — ML READY")
 print("=" * 60)
-print("Original Gamma Bot + Intelligence Bot — MERGED")
 print("Modules:")
-print("  1. GEX Core (original)")
-print("  2. VWAP Cross Alerts (original)")
-print("  3. Conviction Spike (original)")
+print("  1. GEX Core")
+print("  2. VWAP Cross Alerts")
+print("  3. Conviction Spike")
 print("  4. Regime Detection Engine")
 print("  5. Hedge Unwind Detector")
 print("  6. Vanna / Charm Engine")
@@ -1470,7 +1829,16 @@ print("  8. VIX / VVIX + Momentum")
 print("  9. TICK + Inventory Precision")
 print(" 10. Calendar / Quarter System")
 print(" 11. Unified Conviction Scorer")
-print(" 12. CSV Data Logger")
+print(" 12. ML Data Logger — FULLY AUTOMATED")
+print("     → Intraday features: auto")
+print("     → News sentiment: auto")
+print("     → Catalyst detection: auto")
+print("     → Outcomes: auto at EOD")
+print("     → GitHub commit: auto")
+print("     → /notes command: optional")
+print("=" * 60)
+print("Add NEWS_API_KEY to Railway for news sentiment")
+print("Get free key at: newsapi.org")
 print("=" * 60)
 init_log()
 run_job()
