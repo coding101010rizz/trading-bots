@@ -6,6 +6,7 @@ import time
 import asyncio
 import yfinance as yf
 import numpy as np
+import anthropic
 from datetime import datetime, date, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Bot
@@ -53,6 +54,11 @@ LOG_HEADERS = [
     "signal_correct",
     "max_move_up",
     "max_move_down",
+    # AI verification — auto via Claude API
+    "claude_verdict",
+    "claude_confidence",
+    "claude_reasoning",
+    "combined_score",
     # Only this needs you — optional
     "notes"
 ]
@@ -288,7 +294,109 @@ def get_intraday_features(price, vol_gex):
         ]}
 
 
-def git_commit_log():
+# ─────────────────────────────────────────────
+# AI VERIFICATION LAYER
+# Sends signal data to Claude API for
+# independent review before firing alert
+# Logs verdict to CSV for ML training
+# ─────────────────────────────────────────────
+def verify_signal_with_claude(signal_type, price, gex_state, regime,
+                                vol_gex, oi_gex, ratio, vix, vvix,
+                                news_sentiment, catalyst_type,
+                                macro_override, conviction_score,
+                                unwind_score, vanna_target, charm_target):
+    """
+    Sends current market snapshot to Claude for verification.
+    Returns: verdict, confidence, reasoning, combined_score
+
+    Verdict options:
+    CONFIRM  — Claude agrees with bot signal
+    CHALLENGE — Claude disagrees or sees risk
+    NEUTRAL  — Insufficient data to verify
+    """
+    if not anthropic_client:
+        return "UNAVAILABLE", 0, "No API key configured", conviction_score
+
+    try:
+        vol_b = round(vol_gex / 1e9, 2)
+        oi_b = round(oi_gex / 1e9, 2)
+
+        prompt = f"""You are an expert options flow analyst reviewing a SPY 0DTE trading signal.
+Analyze this market data and verify whether the bot signal is sound.
+
+CURRENT MARKET DATA:
+- SPY Price: ${price}
+- GEX State: {gex_state}
+- Regime: {regime}
+- Vol GEX: {vol_b}B (raw)
+- OI GEX: {oi_b}B (raw)
+- Vol/OI Ratio: {ratio:.2f}x
+- VIX: {vix}
+- VVIX: {vvix}
+- News Sentiment: {news_sentiment}
+- Catalyst Type: {catalyst_type}
+- Macro Override: {macro_override}
+- Unwind Score: {unwind_score}/100
+- Vanna Target: ${vanna_target or 'None'}
+- Charm Target: ${charm_target or 'None'}
+- Bot Conviction: {conviction_score}/100
+
+SIGNAL BEING EVALUATED: {signal_type}
+
+Rules for your analysis:
+1. If macro_override is YES and catalyst is GEO or FED, reduce confidence in structure signals
+2. If Vol GEX and OI GEX are same sign with ratio > 1.5x, signal is directionally confirmed
+3. If VVIX > 100, velocity conditions support premium expansion
+4. If unwind_score > 40, mechanical bullish pressure exists regardless of structure
+5. Contradictions between news and GEX signal = higher risk
+
+Respond in this exact JSON format, nothing else:
+{{
+  "verdict": "CONFIRM" or "CHALLENGE" or "NEUTRAL",
+  "confidence": <integer 0-100>,
+  "reasoning": "<2-3 sentences max explaining your verdict>",
+  "risk_factor": "<single biggest risk to this signal>"
+}}"""
+
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import json
+        raw = response.content[0].text.strip()
+        # Clean any markdown fences if present
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+
+        verdict = result.get("verdict", "NEUTRAL")
+        confidence = int(result.get("confidence", 50))
+        reasoning = result.get("reasoning", "")
+        risk_factor = result.get("risk_factor", "")
+
+        # Calculate combined score
+        if verdict == "CONFIRM":
+            combined = min(100, int(
+                (conviction_score * 0.6) +
+                (confidence * 0.4) * 1.15
+            ))
+        elif verdict == "CHALLENGE":
+            combined = max(0, int(
+                (conviction_score * 0.4) +
+                ((100 - confidence) * 0.2) * 0.7
+            ))
+        else:
+            combined = conviction_score
+
+        full_reasoning = f"{reasoning} Risk: {risk_factor}"
+
+        print(f"🤖 Claude verdict: {verdict} ({confidence}%) | Combined: {combined}")
+        return verdict, confidence, full_reasoning, combined
+
+    except Exception as e:
+        print(f"Claude verification error: {e}")
+        return "UNAVAILABLE", 0, str(e)[:100], conviction_score
     """
     Auto-commits the CSV to GitHub after every EOD write.
     Requires GITHUB_TOKEN in Railway environment variables.
@@ -377,7 +485,9 @@ def init_log():
 def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
                 regime, conv, grade, vix_spot, vvix_val, vix_term,
                 tick_approx, inventory_bias, unwind_score, open_drive,
-                vanna_target, charm_target, cal_flags, days_opex):
+                vanna_target, charm_target, cal_flags, days_opex,
+                claude_verdict="", claude_confidence=0,
+                claude_reasoning="", combined_score=0):
     """
     Fully automated logging — no manual input required.
     Fetches news sentiment, calculates intraday features,
@@ -394,6 +504,11 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
         # Fetch all automated features
         intraday = get_intraday_features(price, vol_gex)
         news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = fetch_news_sentiment()
+
+        # Store for AI verification
+        state["last_news_sentiment"] = news_sentiment
+        state["last_catalyst_type"] = catalyst_type
+        state["last_macro_override"] = macro_override
 
         clean_grade = grade.replace("🔥","").replace("✅","").replace("⚠️","").replace("🔴","").replace("❌","").strip()
 
@@ -444,6 +559,11 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "signal_correct": "",
             "max_move_up": "",
             "max_move_down": "",
+            # AI verification
+            "claude_verdict": claude_verdict,
+            "claude_confidence": claude_confidence,
+            "claude_reasoning": claude_reasoning[:200] if claude_reasoning else "",
+            "combined_score": combined_score,
             # Only optional field for you
             "notes": ""
         }
@@ -462,7 +582,11 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
 UW_TOKEN = os.getenv("UW_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TICKER = "SPY"
+
+# Anthropic client — used for AI signal verification
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # ─────────────────────────────────────────────
 # GLOBAL STATE — unified from both bots
@@ -1857,7 +1981,70 @@ def run_job():
         print(f"VIX:{vix_sig} | VVIX:{vvix_sig}")
         print(f"Flow:{flow_dir} | Grade:{grade}")
 
+        # ── AI VERIFICATION ──
+        # Only call Claude when there's a meaningful signal
+        # to avoid wasting API credits on neutral readings
+        should_verify = (
+            conv >= 50 or
+            regime in ["BEARISH_HEDGE_BUILD", "HEDGE_UNWIND_CONFIRMED",
+                       "HEDGE_UNWIND_EARLY", "BULLISH_MOMENTUM"] or
+            unwind_score >= 40 or
+            gex_state != state["previous_gex_state"] or
+            regime != state["previous_regime"]
+        )
+
+        claude_verdict = "SKIPPED"
+        claude_confidence = 0
+        claude_reasoning = "Low conviction — verification skipped"
+        combined_score = conv
+
+        if should_verify and anthropic_client:
+            signal_desc = (
+                f"{gex_state} regime={regime} "
+                f"conviction={conv}/100 unwind={unwind_score}/100"
+            )
+            claude_verdict, claude_confidence, claude_reasoning, combined_score = \
+                verify_signal_with_claude(
+                    signal_type=signal_desc,
+                    price=price,
+                    gex_state=gex_state,
+                    regime=regime,
+                    vol_gex=vol_gex,
+                    oi_gex=oi_gex,
+                    ratio=ratio,
+                    vix=vix_spot,
+                    vvix=vvix_val,
+                    news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
+                    catalyst_type=state.get("last_catalyst_type", "NONE"),
+                    macro_override=state.get("last_macro_override", "NO"),
+                    conviction_score=conv,
+                    unwind_score=unwind_score,
+                    vanna_target=vt,
+                    charm_target=ct
+                )
+
+        # Format AI verdict for alerts
+        verdict_emoji = (
+            "✅" if claude_verdict == "CONFIRM" else
+            "⚠️" if claude_verdict == "CHALLENGE" else
+            "➖" if claude_verdict == "NEUTRAL" else
+            "🔇"
+        )
+        ai_line = (
+            f"\n🤖 AI VERIFY: {verdict_emoji} {claude_verdict} "
+            f"({claude_confidence}%)\n"
+            f"→ {claude_reasoning[:120]}\n"
+            f"Combined Score: {combined_score}/100"
+            if claude_verdict not in ["SKIPPED", "UNAVAILABLE"]
+            else ""
+        )
+
         # ── LOG EVERY READING TO CSV ──
+        # Store news state for AI verification
+        state["last_news_sentiment"] = state.get("last_news_sentiment", "NEUTRAL")
+        state["last_catalyst_type"] = state.get("last_catalyst_type", "NONE")
+        state["last_macro_override"] = state.get("last_macro_override", "NO")
+
         log_reading(
             price=price,
             oi_gex=oi_gex,
@@ -1879,7 +2066,11 @@ def run_job():
             vanna_target=vt,
             charm_target=ct,
             cal_flags=cal_flags,
-            days_opex=days_opex
+            days_opex=days_opex,
+            claude_verdict=claude_verdict,
+            claude_confidence=claude_confidence,
+            claude_reasoning=claude_reasoning,
+            combined_score=combined_score
         )
 
         # ── ORIGINAL GAMMA BOT: GEX STATE CHANGE ──
@@ -1899,11 +2090,12 @@ def run_job():
                 f"VOL Net GEX: {vol_fmt} ({vol_b}B raw)\n"
                 f"Ratio: {ratio_r}x\n"
                 f"Spot: ${price}\n"
-                f"Time: {now_str}\n"
+                f"Time: {now_str} PDT\n"
                 f"Previous: {state['previous_gex_state'] or 'None'}\n\n"
                 f"📊 REGIME: {regime} ({reg_conf}%)\n"
                 f"🎯 CONVICTION: {conv}/100 — {grade}\n"
                 f"→ {rec}"
+                f"{ai_line}"
             )
             print(f"GEX state alert: {state['previous_gex_state']} → {gex_state}")
 
@@ -1944,6 +2136,7 @@ def run_job():
                 f"🎯 CONVICTION: {conv}/100 — {grade}\n"
                 f"→ {rec}\n\n"
                 f"📋 CHECKLIST\n{cl_text}"
+                f"{ai_line}"
             )
             print(f"Regime alert: {prev} → {regime}")
 
@@ -1956,13 +2149,14 @@ def run_job():
                 f"🚀 HEDGE UNWIND DETECTED — SPY\n"
                 f"{'─'*35}\n"
                 f"Score: {unwind_score}/100 | Flow: {flow_dir}\n"
-                f"Time: {now_str} | Price: ${price}\n\n"
+                f"Time: {now_str} PDT | Price: ${price}\n\n"
                 f"📊 FLOW SIGNALS\n{uw_text}\n\n"
                 f"💡 MECHANICAL EXPLANATION\n"
                 f"Institutions selling puts = MMs buy shares back.\n"
                 f"Price rises with ZERO new call buying needed.\n\n"
                 f"📈 VANNA TARGET: ${vt}\n{vc_text}\n\n"
                 f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}"
+                f"{ai_line}"
             )
             state["hedge_unwind_alert_sent"] = True
             state["last_unwind_alert_time"] = time.time()
