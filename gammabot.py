@@ -360,7 +360,7 @@ Respond in this exact JSON format, nothing else:
 
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=300,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -593,7 +593,7 @@ Write a brief EOD summary. Rules:
 
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=500,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -694,7 +694,7 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             # AI verification
             "claude_verdict": claude_verdict,
             "claude_confidence": claude_confidence,
-            "claude_reasoning": claude_reasoning[:200] if claude_reasoning else "",
+            "claude_reasoning": claude_reasoning[:500] if claude_reasoning else "",
             "combined_score": combined_score,
             # Only optional field for you
             "notes": ""
@@ -766,6 +766,8 @@ state = {
     "regime_transitions_today": 0,
     "vwap_breaks_today": 0,
     "session_vwap": None,
+    "eod_fired_today": False,
+    "regime": None,
 }
 
 # OPEX dates 2026 — update quarterly
@@ -1925,7 +1927,7 @@ def check_consolidation_job():
                 f"Re-assess after 10:00am PDT."
             )
             state["consolidation_alert_sent"] = True
-            state["consolidation_gex_state"] = gex_state
+            state["consolidation_gex_state"] = state.get("previous_gex_state", "")
 
     except Exception as e:
         print(f"Consolidation job error: {e}")
@@ -2207,7 +2209,7 @@ def run_job():
         ai_line = (
             f"\n🤖 AI VERIFY: {verdict_emoji} {claude_verdict} "
             f"({claude_confidence}%)\n"
-            f"→ {claude_reasoning[:120]}\n"
+            f"→ {claude_reasoning[:300]}\n"
             f"Combined Score: {combined_score}/100"
             if claude_verdict not in ["SKIPPED", "UNAVAILABLE"]
             else ""
@@ -2482,15 +2484,18 @@ def run_job():
             state["hedge_unwind_alert_sent"] = False
             print("Hedge unwind alert reset — score elevated, allowing re-fire")
 
-        # FIX 4: Mid-day GEX summary every 90 min during market hours
-        # Fires regardless of other flags — always keep you informed
+        # FIX 4: Mid-day GEX summary every 90 min
+        # Only fires when market is actually open
+        # Guards against pre-market false fires
         last_summary_time = state.get("last_summary_time", 0)
-        if (6 <= h <= 12 and
+        market_is_open = is_market_open()
+        if (market_is_open and
+                6 <= h <= 12 and
                 now_epoch - last_summary_time > 5400):  # 90 min
             alert(
                 f"📊 MID-SESSION UPDATE — SPY\n"
                 f"{'─'*35}\n"
-                f"{now_str} | ${price}\n\n"
+                f"{now_str} PDT | ${price}\n\n"
                 f"GEX State: {gex_state}\n"
                 f"Regime: {regime}\n"
                 f"Ratio: {ratio_r}x\n"
@@ -2502,11 +2507,14 @@ def run_job():
                 f"→ {rec}"
             )
             state["last_summary_time"] = now_epoch
-            print(f"Mid-session update sent at {now_str}")
+            print(f"Mid-session update sent at {now_str} PDT")
 
         # Reset daily flags + end of day auto-fill
         if h >= 13:
-            eod_autofill(price)
+            # Guard: only run EOD once per day
+            if not state.get("eod_fired_today"):
+                eod_autofill(price)
+                state["eod_fired_today"] = True
             state["velocity_score_sent"] = False
             state["consolidation_alert_sent"] = False
             state["hedge_unwind_alert_sent"] = False
@@ -2534,6 +2542,7 @@ def run_job():
         state["previous_vol_gex"] = vol_gex
         state["previous_oi_gex"] = oi_gex
         state["previous_regime"] = regime
+        state["regime"] = regime
         state["last_conviction_score"] = conv
 
     except Exception as e:
@@ -2611,6 +2620,17 @@ def check_telegram_commands():
 # ─────────────────────────────────────────────
 # SCHEDULE (original gamma bot times preserved)
 # ─────────────────────────────────────────────
+def midnight_reset():
+    """
+    Resets eod_fired_today at midnight PDT
+    so EOD can fire again the next trading day.
+    """
+    pdt = now_pdt()
+    if pdt.hour == 0:
+        state["eod_fired_today"] = False
+        print("🌙 Midnight reset — EOD flag cleared for new trading day")
+
+
 schedule.every().day.at("13:00").do(run_job)  # 6:00am PDT
 schedule.every().day.at("13:30").do(run_job)  # 6:30am PDT
 schedule.every().day.at("14:00").do(run_job)  # 7:00am PDT
@@ -2628,6 +2648,7 @@ schedule.every(5).minutes.do(check_consolidation_job)
 schedule.every(5).minutes.do(check_telegram_commands)
 schedule.every(5).minutes.do(check_doji_transition)
 schedule.every(5).minutes.do(check_gamma_wall_approach)
+schedule.every(5).minutes.do(midnight_reset)
 schedule.every(60).minutes.do(check_heartbeat)
 
 print("SPY UNIFIED BOT v4.1 — ML READY")
