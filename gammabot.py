@@ -932,20 +932,13 @@ def run_overnight_check():
     now_str = pdt.strftime("%H:%M")
 
     # Cap overnight alerts — don't spam all night
-    if state.get("overnight_alerts_today", 0) >= 6:
+    if state.get("overnight_alerts_today", 0) >= 3:  # was 6 — max 3 per night
         return
 
-    # Regular overnight check — every 90 min
+    # Minimum 2 hours between any overnight alert (was 60-90 min)
     last_check = state.get("last_overnight_check", 0)
     time_since_last = now_epoch - last_check
-
-    # During evening hours (6pm-11pm PDT) check more frequently
-    # This is when most major overnight events happen
-    check_interval = 5400  # 90 min default
-    if 18 <= h <= 23:
-        check_interval = 3600  # 60 min during evening
-
-    if time_since_last < check_interval:
+    if time_since_last < 7200:
         return
 
     try:
@@ -964,21 +957,21 @@ def run_overnight_check():
         macro_override = overnight.get("macro_override", "NO")
         news_sentiment = overnight.get("news_sentiment", "NEUTRAL")
 
-        # Determine if alert is worth sending
-        significant_futures = abs(futures_chg) >= 0.5
-        significant_vix = abs(vix_change) >= 2.0
-        major_event = news_flag == "MAJOR_EVENT"
-        minor_event = news_flag == "MINOR" and catalyst_str >= 50
-        regular_evening_update = (18 <= h <= 20 and
+        # Stricter thresholds — only genuinely notable events
+        significant_futures = abs(futures_chg) >= 1.0   # was 0.5%
+        significant_vix = abs(vix_change) >= 3.0         # was 2.0pts
+        major_event = news_flag == "MAJOR_EVENT" and catalyst_str >= 70
+        # One evening summary only at 7-8pm, never fires again after sent
+        regular_evening_update = (19 <= h <= 20 and
                                   not state.get("overnight_report_sent"))
 
         should_alert = (significant_futures or significant_vix or
-                        major_event or minor_event or regular_evening_update)
+                        major_event or regular_evening_update)
 
         if not should_alert:
             state["last_overnight_check"] = now_epoch
-            print(f"Overnight check {now_str}: quiet (futures {futures_chg:+.1f}%, "
-                  f"VIX {vix_dir})")
+            print(f"Overnight check {now_str}: quiet — "
+                  f"futures {futures_chg:+.1f}%, VIX {vix_dir}")
             return
 
         # Determine alert type
@@ -3226,7 +3219,9 @@ schedule.every(60).minutes.do(check_heartbeat)
 
 # Overnight monitoring — runs every 30 min
 # The function itself checks if it's appropriate to alert
-schedule.every(30).minutes.do(run_overnight_check)
+# Overnight monitoring — checks every 90 min but only alerts on notable events
+# Alert thresholds: futures >1%, VIX change >3pts, major news, or 7-8pm summary
+schedule.every(90).minutes.do(run_overnight_check)
 
 print("SPY UNIFIED BOT v5.1 — PERSISTENT ML + OVERNIGHT")
 print("=" * 60)
