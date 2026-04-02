@@ -130,6 +130,11 @@ state = {
     "open_drive_detected": False, # open drive confirmation
     "session_high": None,
     "session_low": None,
+
+    # Alert timing fixes
+    "last_unwind_alert_time": 0,  # epoch time of last unwind alert
+    "last_summary_time": 0,       # epoch time of last mid-session summary
+    "consolidation_gex_state": None,  # GEX state when consolidation fired
 }
 
 # OPEX dates 2026 — update quarterly
@@ -1018,6 +1023,7 @@ def check_consolidation_job():
                 f"Re-assess after 10:00am PDT."
             )
             state["consolidation_alert_sent"] = True
+            state["consolidation_gex_state"] = gex_state
 
     except Exception as e:
         print(f"Consolidation job error: {e}")
@@ -1295,6 +1301,7 @@ def run_job():
                 f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}"
             )
             state["hedge_unwind_alert_sent"] = True
+            state["last_unwind_alert_time"] = time.time()
 
         if unwind_score < 20:
             state["hedge_unwind_alert_sent"] = False
@@ -1319,14 +1326,23 @@ def run_job():
 
         # ── MORNING VELOCITY REPORT ──
         h, m = datetime.now().hour, datetime.now().minute
+
+        # FIX 1: Morning report fires once at open
+        # BUT re-fires if conviction score changes significantly
+        # so you never miss a major setup shift after 6:30am
         if (h == 6 and m >= 25) or (h == 7 and m <= 15):
-            if not state["velocity_score_sent"]:
+            conviction_changed = (
+                state["last_conviction_score"] is not None and
+                abs(conv - state["last_conviction_score"]) >= 15
+            )
+            if not state["velocity_score_sent"] or conviction_changed:
                 cl_text = "\n".join(checklist)
                 cal_text = "\n".join(cal_flags) if cal_flags else "No special events"
                 uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None yet"
+                update_tag = "🔄 UPDATED — " if conviction_changed else ""
 
                 alert(
-                    f"🌅 PRE-MARKET REPORT — SPY\n"
+                    f"🌅 {update_tag}PRE-MARKET REPORT — SPY\n"
                     f"{'─'*35}\n"
                     f"{now_str} | ${price}\n\n"
                     f"🎯 CONVICTION: {conv}/100\n"
@@ -1352,12 +1368,54 @@ def run_job():
                 state["velocity_score_sent"] = True
                 print(f"Morning report sent. Score: {conv}/100")
 
+        # FIX 2: Consolidation alert resets if market structure
+        # changes — so it can re-fire if setup resolves and returns
+        if state["consolidation_alert_sent"]:
+            if gex_state != state.get("consolidation_gex_state"):
+                state["consolidation_alert_sent"] = False
+                print("Consolidation alert reset — GEX state changed")
+
+        # FIX 3: Hedge unwind alert allows re-firing every 45min
+        # if unwind score keeps growing — catches escalating flow
+        now_epoch = time.time()
+        last_unwind_time = state.get("last_unwind_alert_time", 0)
+        if (state["hedge_unwind_alert_sent"] and
+                unwind_score >= 60 and
+                now_epoch - last_unwind_time > 2700):  # 45 min
+            state["hedge_unwind_alert_sent"] = False
+            print("Hedge unwind alert reset — score elevated, allowing re-fire")
+
+        # FIX 4: Mid-day GEX summary every 90 min during market hours
+        # Fires regardless of other flags — always keep you informed
+        last_summary_time = state.get("last_summary_time", 0)
+        if (6 <= h <= 12 and
+                now_epoch - last_summary_time > 5400):  # 90 min
+            alert(
+                f"📊 MID-SESSION UPDATE — SPY\n"
+                f"{'─'*35}\n"
+                f"{now_str} | ${price}\n\n"
+                f"GEX State: {gex_state}\n"
+                f"Regime: {regime}\n"
+                f"Ratio: {ratio_r}x\n"
+                f"OI: {oi_fmt} | VOL: {vol_fmt}\n\n"
+                f"VIX: {vix_sig} | VVIX: {vvix_sig}\n"
+                f"Flow: {flow_dir}\n"
+                f"Unwind Score: {unwind_score}/100\n\n"
+                f"🎯 Conviction: {conv}/100 — {grade}\n"
+                f"→ {rec}"
+            )
+            state["last_summary_time"] = now_epoch
+            print(f"Mid-session update sent at {now_str}")
+
         # Reset daily flags + end of day auto-fill
         if h >= 13:
             eod_autofill(price)
             state["velocity_score_sent"] = False
             state["consolidation_alert_sent"] = False
             state["hedge_unwind_alert_sent"] = False
+            state["last_unwind_alert_time"] = 0
+            state["last_summary_time"] = 0
+            state["consolidation_gex_state"] = None
             state["open_time_prices"] = []
             state["open_price"] = None
             state["open_iv"] = None
