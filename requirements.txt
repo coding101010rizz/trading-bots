@@ -4,3 +4,4 @@ python-telegram-bot
 python-dotenv
 yfinance
 numpy
+anthropic
