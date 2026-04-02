@@ -474,6 +474,138 @@ Respond in this exact JSON format, nothing else:
         print(f"Git commit error (non-critical): {e}")
 
 
+# ─────────────────────────────────────────────
+# CLAUDE ALERT WRITER
+# Claude writes the full alert text from scratch
+# No templates — every alert unique to the moment
+# Used for: morning report, regime transition,
+#           hedge unwind, EOD summary
+# ─────────────────────────────────────────────
+def write_alert_with_claude(alert_type, price, gex_state, regime,
+                             vol_gex, oi_gex, ratio, vix, vvix,
+                             conviction, combined, unwind_score,
+                             vanna_target, charm_target, news_sentiment,
+                             catalyst_type, macro_override, flow_dir,
+                             previous_regime, previous_gex_state,
+                             claude_verdict, extra_context=""):
+    """
+    Claude writes the full alert text from scratch.
+    No templates. Every alert is unique to that moment.
+    Falls back to None if API unavailable — caller
+    uses template as fallback.
+    """
+    if not anthropic_client:
+        return None
+
+    try:
+        vol_b = round(vol_gex / 1e9, 2)
+        oi_b = round(oi_gex / 1e9, 2)
+        now_str = now_pdt().strftime("%H:%M")
+
+        prompts = {
+            "morning_report": f"""You are writing a pre-market briefing for a SPY 0DTE options trader in California.
+Time: {now_str} PDT | SPY: ${price}
+
+Market data:
+- Regime: {regime} (was {previous_regime})
+- GEX State: {gex_state}
+- Vol GEX: {vol_b}B | OI GEX: {oi_b}B | Ratio: {ratio:.2f}x
+- VIX: {vix} | VVIX: {vvix}
+- Conviction: {conviction}/100 | AI Combined: {combined}/100
+- News: {news_sentiment} | Catalyst: {catalyst_type} | Override: {macro_override}
+- Unwind Score: {unwind_score}/100
+- Vanna target: ${vanna_target or 'none'} | Charm: ${charm_target or 'none'}
+{extra_context}
+
+Write a morning briefing. Rules:
+- Max 10 lines total
+- Plain English — no jargon
+- Tell them what to expect today and why
+- Give one clear actionable recommendation
+- Name the biggest risk for today
+- End with: what size to trade and when to enter
+- Write like an experienced trader talking to a friend
+- No bullet points, no section headers
+- Use 1-2 emojis max, naturally placed""",
+
+            "regime_transition": f"""You are writing a trading alert for a SPY 0DTE options trader.
+Time: {now_str} PDT | SPY: ${price}
+
+What just changed:
+- Regime: {previous_regime} → {regime}
+- GEX: {gex_state} | Vol: {vol_b}B | OI: {oi_b}B
+- Ratio: {ratio:.2f}x | VIX: {vix} | VVIX: {vvix}
+- Conviction: {conviction}/100 | AI Combined: {combined}/100
+- News: {news_sentiment} | Catalyst: {catalyst_type}
+- Macro Override: {macro_override}
+- Vanna target: ${vanna_target or 'none'}
+- AI verdict: {claude_verdict}
+{extra_context}
+
+Write a regime transition alert. Rules:
+- Max 8 lines total
+- Line 1: what just changed and why it matters right now
+- Line 2-3: what this means mechanically in plain English
+- Line 4-5: exactly what to do — calls or puts, entry, target, stop
+- Line 6: the one thing that kills this trade
+- No bullet points, no headers
+- 1-2 emojis max""",
+
+            "hedge_unwind": f"""You are writing a hedge unwind alert for a SPY 0DTE options trader.
+Time: {now_str} PDT | SPY: ${price}
+
+Signal:
+- Unwind score: {unwind_score}/100
+- Regime: {regime} | Flow: {flow_dir}
+- Vol GEX: {vol_b}B
+- Vanna target: ${vanna_target or 'none'}
+- VIX: {vix} | VVIX: {vvix}
+- Conviction: {conviction}/100 | AI Combined: {combined}/100
+- News: {news_sentiment} | Catalyst: {catalyst_type}
+- AI verdict: {claude_verdict}
+{extra_context}
+
+Write a hedge unwind alert. Rules:
+- Max 7 lines total
+- Explain in plain English why price is rising
+  (institutions closing puts forces MMs to buy shares)
+- Give the specific call target price
+- Give the exit zone — where to sell
+- Name the one thing that kills this trade
+- No jargon
+- 1-2 emojis max""",
+
+            "eod_summary": f"""You are writing an end of day summary for a SPY 0DTE options trader.
+{extra_context}
+
+Write a brief EOD summary. Rules:
+- Max 8 lines total
+- What happened today in plain English
+- Was the morning signal right or wrong and why
+- What to watch for tomorrow morning
+- Any overnight risks
+- Honest — if signal was wrong say so clearly
+- 1-2 emojis max
+- Last line: one sentence on tomorrow's bias"""
+        }
+
+        prompt = prompts.get(alert_type, prompts["regime_transition"])
+
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        text = response.content[0].text.strip()
+        print(f"✍️ Claude wrote {alert_type} ({len(text)} chars)")
+        return text
+
+    except Exception as e:
+        print(f"Claude alert writer error: {e}")
+        return None
+
+
 def init_log():
     """Create CSV file with headers if it doesn't exist."""
     if not os.path.exists(LOG_FILE):
@@ -1898,22 +2030,64 @@ def eod_autofill(close_price):
         max_up = round(session_high - open_price, 2)
         max_down = round(open_price - session_low, 2)
 
-        alert(
-            f"📊 END OF DAY SUMMARY — SPY\n"
-            f"{'─'*35}\n"
-            f"Date: {today_str} | {now_str}\n\n"
-            f"Open:  ${round(open_price, 2)}\n"
-            f"Close: ${round(close_price, 2)}\n"
-            f"Move:  {'+' if point_move > 0 else ''}{point_move} pts\n"
-            f"Direction: {direction}\n"
-            f"Max Up: +{max_up} | Max Down: -{max_down}\n\n"
-            f"Signal: {morning_signal or 'None'}\n"
-            f"Correct: {signal_emoji} {correct}\n\n"
-            f"📝 {updated} rows logged automatically\n"
-            f"💾 CSV saved to GitHub\n\n"
-            f"💬 Add context? Reply:\n"
-            f"/notes Iran news drove the gap"
+        eod_context = (
+            f"Date: {today_str}\n"
+            f"Open: ${round(open_price,2)} | Close: ${round(close_price,2)}\n"
+            f"Move: {'+' if point_move > 0 else ''}{point_move} pts ({direction})\n"
+            f"Max up from open: +{max_up} | Max down: -{max_down}\n"
+            f"Morning signal: {morning_signal or 'None'}\n"
+            f"Signal correct: {correct}\n"
+            f"Rows logged: {updated}"
         )
+
+        written = write_alert_with_claude(
+            alert_type="eod_summary",
+            price=close_price,
+            gex_state=state.get("previous_gex_state", ""),
+            regime=state.get("previous_regime", ""),
+            vol_gex=state.get("previous_vol_gex", 0) or 0,
+            oi_gex=state.get("previous_oi_gex", 0) or 0,
+            ratio=0, vix=0, vvix=0,
+            conviction=0, combined=0,
+            unwind_score=0,
+            vanna_target=None, charm_target=None,
+            news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
+            catalyst_type=state.get("last_catalyst_type", "NONE"),
+            macro_override=state.get("last_macro_override", "NO"),
+            flow_dir="",
+            previous_regime="", previous_gex_state="",
+            claude_verdict="",
+            extra_context=eod_context
+        )
+
+        if written:
+            alert(
+                f"📊 END OF DAY — SPY\n"
+                f"{'─'*35}\n"
+                f"{today_str} | {now_str} PDT\n"
+                f"Open ${round(open_price,2)} → Close ${round(close_price,2)} "
+                f"({'+' if point_move > 0 else ''}{point_move} pts) "
+                f"{signal_emoji}\n\n"
+                f"{written}\n\n"
+                f"💾 {updated} rows saved to GitHub\n"
+                f"💬 /notes to add context"
+            )
+        else:
+            alert(
+                f"📊 END OF DAY SUMMARY — SPY\n"
+                f"{'─'*35}\n"
+                f"Date: {today_str} | {now_str} PDT\n\n"
+                f"Open:  ${round(open_price, 2)}\n"
+                f"Close: ${round(close_price, 2)}\n"
+                f"Move:  {'+' if point_move > 0 else ''}{point_move} pts\n"
+                f"Direction: {direction}\n"
+                f"Max Up: +{max_up} | Max Down: -{max_down}\n\n"
+                f"Signal: {morning_signal or 'None'}\n"
+                f"Correct: {signal_emoji} {correct}\n\n"
+                f"📝 {updated} rows logged\n"
+                f"💾 CSV saved to GitHub\n"
+                f"💬 /notes to add context"
+            )
 
         print(f"EOD complete — {updated} rows | {direction} {point_move}pts | {correct}")
 
@@ -2116,28 +2290,46 @@ def run_job():
             uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None"
             cal_text = "\n".join(cal_flags) if cal_flags else "No special events"
 
-            alert(
-                f"{r_emoji} REGIME TRANSITION — SPY\n"
-                f"{'─'*35}\n"
-                f"NEW: {regime} | WAS: {prev}\n"
-                f"Confidence: {reg_conf}%\n"
-                f"Time: {now_str} | Price: ${price}\n\n"
-                f"📊 REGIME MEANING\n{reg_signal}\n\n"
-                f"📈 VANNA / CHARM\n{vc_text}\n\n"
-                f"🔍 OPTIONS FLOW\n"
-                f"Direction: {flow_dir}\n"
-                f"Unwind: {unwind_score}/100\n"
-                f"{uw_text}\n\n"
-                f"📊 PRECISION\n"
-                f"{tick_signal}\n"
-                f"Inventory: {inventory_bias}\n"
-                f"{'🚀 OPEN DRIVE ACTIVE' if open_drive else ''}\n\n"
-                f"🗓️ CALENDAR\n{cal_text}\n\n"
-                f"🎯 CONVICTION: {conv}/100 — {grade}\n"
-                f"→ {rec}\n\n"
-                f"📋 CHECKLIST\n{cl_text}"
-                f"{ai_line}"
+            # Try Claude-written alert first
+            written = write_alert_with_claude(
+                alert_type="regime_transition",
+                price=price, gex_state=gex_state, regime=regime,
+                vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
+                vix=vix_spot, vvix=vvix_val,
+                conviction=conv, combined=combined_score,
+                unwind_score=unwind_score,
+                vanna_target=vt, charm_target=ct,
+                news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
+                catalyst_type=state.get("last_catalyst_type", "NONE"),
+                macro_override=state.get("last_macro_override", "NO"),
+                flow_dir=flow_dir,
+                previous_regime=prev,
+                previous_gex_state=state.get("previous_gex_state", ""),
+                claude_verdict=claude_verdict
             )
+
+            if written:
+                alert(
+                    f"{r_emoji} REGIME TRANSITION — SPY\n"
+                    f"{'─'*35}\n"
+                    f"{prev} → {regime} | {now_str} PDT\n\n"
+                    f"{written}"
+                )
+            else:
+                # Template fallback
+                alert(
+                    f"{r_emoji} REGIME TRANSITION — SPY\n"
+                    f"{'─'*35}\n"
+                    f"NEW: {regime} | WAS: {prev}\n"
+                    f"Confidence: {reg_conf}%\n"
+                    f"Time: {now_str} PDT | Price: ${price}\n\n"
+                    f"📊 REGIME MEANING\n{reg_signal}\n\n"
+                    f"📈 VANNA / CHARM\n{vc_text}\n\n"
+                    f"🎯 CONVICTION: {conv}/100 — {grade}\n"
+                    f"→ {rec}\n\n"
+                    f"📋 CHECKLIST\n{cl_text}"
+                    f"{ai_line}"
+                )
             print(f"Regime alert: {prev} → {regime}")
 
         # ── HEDGE UNWIND STANDALONE ──
@@ -2145,19 +2337,45 @@ def run_job():
               and unwind_score >= 40
               and regime == state["previous_regime"]):
             uw_text = "\n".join(unwind_sigs)
-            alert(
-                f"🚀 HEDGE UNWIND DETECTED — SPY\n"
-                f"{'─'*35}\n"
-                f"Score: {unwind_score}/100 | Flow: {flow_dir}\n"
-                f"Time: {now_str} PDT | Price: ${price}\n\n"
-                f"📊 FLOW SIGNALS\n{uw_text}\n\n"
-                f"💡 MECHANICAL EXPLANATION\n"
-                f"Institutions selling puts = MMs buy shares back.\n"
-                f"Price rises with ZERO new call buying needed.\n\n"
-                f"📈 VANNA TARGET: ${vt}\n{vc_text}\n\n"
-                f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}"
-                f"{ai_line}"
+
+            written = write_alert_with_claude(
+                alert_type="hedge_unwind",
+                price=price, gex_state=gex_state, regime=regime,
+                vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
+                vix=vix_spot, vvix=vvix_val,
+                conviction=conv, combined=combined_score,
+                unwind_score=unwind_score,
+                vanna_target=vt, charm_target=ct,
+                news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
+                catalyst_type=state.get("last_catalyst_type", "NONE"),
+                macro_override=state.get("last_macro_override", "NO"),
+                flow_dir=flow_dir,
+                previous_regime=state.get("previous_regime", ""),
+                previous_gex_state=state.get("previous_gex_state", ""),
+                claude_verdict=claude_verdict,
+                extra_context=f"Flow signals:\n{uw_text}"
             )
+
+            if written:
+                alert(
+                    f"🚀 HEDGE UNWIND — SPY\n"
+                    f"{'─'*35}\n"
+                    f"{now_str} PDT | ${price} | Score: {unwind_score}/100\n\n"
+                    f"{written}"
+                )
+            else:
+                alert(
+                    f"🚀 HEDGE UNWIND DETECTED — SPY\n"
+                    f"{'─'*35}\n"
+                    f"Score: {unwind_score}/100 | Flow: {flow_dir}\n"
+                    f"Time: {now_str} PDT | Price: ${price}\n\n"
+                    f"📊 FLOW SIGNALS\n{uw_text}\n\n"
+                    f"Institutions selling puts = MMs buy shares back.\n"
+                    f"Price rises with ZERO new call buying needed.\n\n"
+                    f"📈 VANNA TARGET: ${vt}\n\n"
+                    f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}"
+                    f"{ai_line}"
+                )
             state["hedge_unwind_alert_sent"] = True
             state["last_unwind_alert_time"] = time.time()
 
@@ -2195,35 +2413,55 @@ def run_job():
                 abs(conv - state["last_conviction_score"]) >= 15
             )
             if not state["velocity_score_sent"] or conviction_changed:
-                cl_text = "\n".join(checklist)
                 cal_text = "\n".join(cal_flags) if cal_flags else "No special events"
-                uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None yet"
                 update_tag = "🔄 UPDATED — " if conviction_changed else ""
 
-                alert(
-                    f"🌅 {update_tag}PRE-MARKET REPORT — SPY\n"
-                    f"{'─'*35}\n"
-                    f"{now_str} | ${price}\n\n"
-                    f"🎯 CONVICTION: {conv}/100\n"
-                    f"Grade: {grade}\n"
-                    f"→ {rec}\n\n"
-                    f"📋 CHECKLIST\n{cl_text}\n\n"
-                    f"🔄 REGIME: {regime}\n{reg_signal}\n\n"
-                    f"📈 VANNA / CHARM\n{vc_text}\n\n"
-                    f"📊 PRECISION READ\n"
-                    f"{tick_signal}\n"
-                    f"Inventory: {inventory_bias}\n\n"
-                    f"🗓️ CALENDAR\n{cal_text}\n\n"
-                    f"🔍 EARLY FLOW\n{uw_text}\n\n"
-                    f"VIX: {vix_sig}\n"
-                    f"VVIX: {vvix_sig}\n"
-                    f"Term: {term_sig}\n\n"
-                    f"⚡ GUIDE\n"
-                    f"80-100 → Full size. 400-700% day.\n"
-                    f"65-79 → Normal size. 200-400% realistic.\n"
-                    f"50-64 → Half size. Wait for open.\n"
-                    f"Below 50 → Sit out. Theta wins."
+                written = write_alert_with_claude(
+                    alert_type="morning_report",
+                    price=price, gex_state=gex_state, regime=regime,
+                    vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
+                    vix=vix_spot, vvix=vvix_val,
+                    conviction=conv, combined=combined_score,
+                    unwind_score=unwind_score,
+                    vanna_target=vt, charm_target=ct,
+                    news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
+                    catalyst_type=state.get("last_catalyst_type", "NONE"),
+                    macro_override=state.get("last_macro_override", "NO"),
+                    flow_dir=flow_dir,
+                    previous_regime=state.get("previous_regime", ""),
+                    previous_gex_state=state.get("previous_gex_state", ""),
+                    claude_verdict=claude_verdict,
+                    extra_context=f"Calendar: {cal_text}\nVIX signal: {vix_sig}\nVVIX signal: {vvix_sig}"
                 )
+
+                if written:
+                    alert(
+                        f"🌅 {update_tag}MORNING BRIEF — SPY\n"
+                        f"{'─'*35}\n"
+                        f"{now_str} PDT | ${price} | Score: {combined_score}/100\n\n"
+                        f"{written}"
+                    )
+                else:
+                    # Template fallback
+                    cl_text = "\n".join(checklist)
+                    uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None yet"
+                    alert(
+                        f"🌅 {update_tag}PRE-MARKET REPORT — SPY\n"
+                        f"{'─'*35}\n"
+                        f"{now_str} PDT | ${price}\n\n"
+                        f"🎯 CONVICTION: {conv}/100\n"
+                        f"Grade: {grade}\n"
+                        f"→ {rec}\n\n"
+                        f"📋 CHECKLIST\n{cl_text}\n\n"
+                        f"🔄 REGIME: {regime}\n{reg_signal}\n\n"
+                        f"VIX: {vix_sig}\n"
+                        f"VVIX: {vvix_sig}\n\n"
+                        f"⚡ GUIDE\n"
+                        f"80-100 → Full size.\n"
+                        f"65-79 → Normal size.\n"
+                        f"50-64 → Half size.\n"
+                        f"Below 50 → Sit out."
+                    )
                 state["velocity_score_sent"] = True
                 print(f"Morning report sent. Score: {conv}/100")
 
