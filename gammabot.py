@@ -4,6 +4,7 @@ import requests
 import schedule
 import time
 import asyncio
+import pandas as pd
 import yfinance as yf
 import numpy as np
 import anthropic
@@ -626,7 +627,7 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
     and writes complete ML-ready row to CSV.
     """
     try:
-        now = datetime.now()
+        now = now_pdt()
         cal_summary = (
             "QUARTER_END" if "QUARTER END TODAY" in str(cal_flags) else
             "OPEX_DAY" if "OPEX DAY" in str(cal_flags) else
@@ -1264,9 +1265,13 @@ def fetch_tick_and_inventory():
         if spy.empty or len(spy) < 10:
             return "UNAVAILABLE", 0, "NEUTRAL", False
 
-        closes = spy["Close"].iloc[-10:].values.flatten()
-        opens = spy["Open"].iloc[-10:].values.flatten()
-        volumes = spy["Volume"].iloc[-10:].values.flatten()
+        # Fix for yfinance MultiIndex columns — squeeze to simple Series
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+
+        closes = spy["Close"].iloc[-10:].values.flatten().astype(float)
+        opens = spy["Open"].iloc[-10:].values.flatten().astype(float)
+        volumes = spy["Volume"].iloc[-10:].values.flatten().astype(float)
 
         # TICK approximation
         up_bars = sum(1 for c, o in zip(closes, opens) if c > o)
@@ -1286,9 +1291,9 @@ def fetch_tick_and_inventory():
             t < -300 for t in state["tick_history"][-3:]
         )
 
-        # Session high/low tracking
-        session_high = float(spy["High"].max())
-        session_low = float(spy["Low"].min())
+        # Session high/low tracking — force scalar with float()
+        session_high = float(spy["High"].values.max())
+        session_low = float(spy["Low"].values.min())
         state["session_high"] = session_high
         state["session_low"] = session_low
 
@@ -1553,6 +1558,8 @@ def get_vwap():
         spy = yf.download("SPY", period="1d", interval="5m", progress=False)
         if spy.empty:
             return None, None, None, None, None
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
         spy["vwap"] = (spy["Close"] * spy["Volume"]).cumsum() / spy["Volume"].cumsum()
         cp = float(spy["Close"].iloc[-1])
         cv = float(spy["vwap"].iloc[-1])
@@ -1934,9 +1941,67 @@ def check_consolidation_job():
 
 
 # ─────────────────────────────────────────────
+# GIT AUTO-COMMIT
+# Saves CSV to GitHub after EOD
+# Requires GITHUB_TOKEN in Railway vars
+# ─────────────────────────────────────────────
+def git_commit_log():
+    try:
+        import subprocess
+        github_token = os.getenv("GITHUB_TOKEN", "")
+        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+
+        if not github_token:
+            print("⚠️ GITHUB_TOKEN not set — CSV not committed")
+            return
+
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
+
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", remote_url],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "gammabot@railway.app"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "GammaBot"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "add", LOG_FILE],
+            check=True, capture_output=True
+        )
+
+        result = subprocess.run(
+            ["git", "diff", "--staged", "--quiet"],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            print("📝 No new CSV data to commit")
+            return
+
+        subprocess.run([
+            "git", "commit", "-m",
+            f"Auto-log: SPY GEX data {today_str}"
+        ], check=True, capture_output=True)
+
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            check=True, capture_output=True
+        )
+        print(f"✅ CSV committed to GitHub: {today_str}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Git commit error: {e}")
+    except Exception as e:
+        print(f"Git commit error (non-critical): {e}")
+
+
+# ─────────────────────────────────────────────
 # END OF DAY AUTO-FILL
-# Runs at 1pm PDT — automatically fills outcome
-# columns for today's rows in the CSV log
 # ─────────────────────────────────────────────
 def eod_autofill(close_price):
     """
@@ -1949,7 +2014,7 @@ def eod_autofill(close_price):
     You still manually fill: notes column for context.
     """
     try:
-        today_str = date.today().strftime("%Y-%m-%d")
+        today_str = now_pdt().strftime("%Y-%m-%d")
 
         if not os.path.exists(LOG_FILE):
             return
@@ -2559,19 +2624,69 @@ def run_job():
 # ─────────────────────────────────────────────
 async def handle_telegram_updates():
     """
-    Polls Telegram for /notes commands.
-    Writes the note to today's CSV rows.
-    Run every 5 minutes during market hours.
+    Polls Telegram for /notes and /status commands.
+    /notes [text] → saves note to today's CSV rows
+    /status → replies with bot health and today's data
     """
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         updates = await bot.get_updates(timeout=5)
-        today_str = date.today().strftime("%Y-%m-%d")
+        today_str = now_pdt().strftime("%Y-%m-%d")
 
         for update in updates:
             if not update.message:
                 continue
             text = update.message.text or ""
+
+            # ── /status command ──
+            if text.strip() == "/status":
+                rows_today = 0
+                last_time = "none"
+                csv_exists = os.path.exists(LOG_FILE)
+
+                if csv_exists:
+                    try:
+                        with open(LOG_FILE, "r", newline="") as f:
+                            reader = csv.DictReader(f)
+                            all_rows = list(reader)
+                            today_rows = [r for r in all_rows if r.get("date") == today_str]
+                            rows_today = len(today_rows)
+                            if today_rows:
+                                last_time = today_rows[-1].get("time", "?")
+                    except Exception:
+                        pass
+
+                uw_ok = "✅" if UW_TOKEN else "❌"
+                tg_ok = "✅" if TELEGRAM_TOKEN else "❌"
+                ai_ok = "✅" if anthropic_client else "❌"
+                gh_ok = "✅" if os.getenv("GITHUB_TOKEN") else "❌"
+                regime = state.get("regime", "unknown")
+                conv = state.get("last_conviction_score", 0)
+                now_str = now_pdt().strftime("%H:%M")
+
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"📊 BOT STATUS\n"
+                        f"{'─'*30}\n"
+                        f"Time: {now_str} PDT\n"
+                        f"Market open: {'YES' if is_market_open() else 'NO'}\n\n"
+                        f"📝 Today's data ({today_str}):\n"
+                        f"Rows logged: {rows_today}\n"
+                        f"Last reading: {last_time} PDT\n"
+                        f"CSV exists: {'YES ✅' if csv_exists else 'NO ❌'}\n\n"
+                        f"🔄 Current state:\n"
+                        f"Regime: {regime}\n"
+                        f"Score: {conv}/100\n\n"
+                        f"🔑 API keys:\n"
+                        f"UW: {uw_ok} | Telegram: {tg_ok}\n"
+                        f"Claude: {ai_ok} | GitHub: {gh_ok}"
+                    )
+                )
+                print(f"Status sent at {now_str}")
+                continue
+
+            # ── /notes command ──
             if not text.startswith("/notes "):
                 continue
 
@@ -2579,7 +2694,6 @@ async def handle_telegram_updates():
             if not note:
                 continue
 
-            # Write note to today's rows
             if not os.path.exists(LOG_FILE):
                 continue
 
