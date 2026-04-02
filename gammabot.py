@@ -6,7 +6,7 @@ import time
 import asyncio
 import yfinance as yf
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Bot
 
@@ -57,8 +57,6 @@ LOG_HEADERS = [
     "notes"
 ]
 
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
-
 # Known economic event calendar
 FED_DATES_2026 = [
     date(2026, 1, 29), date(2026, 3, 19),
@@ -69,85 +67,105 @@ FED_DATES_2026 = [
 
 def fetch_news_sentiment():
     """
-    Pulls latest SPY/market headlines from NewsAPI.
-    Scores sentiment automatically.
+    Pulls latest market headlines from UW's news endpoint.
+    Uses the same UW_TOKEN already in Railway — no new credentials.
+    UW pre-scores sentiment so no keyword matching needed.
     Returns: sentiment, score, catalyst_type, strength, macro_override
     """
     try:
-        if not NEWS_API_KEY:
+        if not UW_TOKEN:
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
-        url = (
-            f"https://newsapi.org/v2/everything?"
-            f"q=SPY+OR+S%26P500+OR+Federal+Reserve+OR+tariff+OR+Iran"
-            f"&language=en&sortBy=publishedAt&pageSize=10"
-            f"&apiKey={NEWS_API_KEY}"
-        )
-        r = requests.get(url, timeout=8)
+        headers = {
+            "Authorization": f"Bearer {UW_TOKEN}",
+            "Accept": "application/json"
+        }
+
+        # Pull major market news — broad market view
+        url = "https://api.unusualwhales.com/api/news/headlines"
+        params = {
+            "major_only": "true",
+            "limit": 20
+        }
+        r = requests.get(url, headers=headers, params=params, timeout=8)
+
         if r.status_code != 200:
+            print(f"UW news error: {r.status_code}")
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
-        articles = r.json().get("articles", [])
-        if not articles:
+        data = r.json().get("data", [])
+        if not data:
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
-        # Keyword scoring
-        bullish_words = [
-            "rally", "surge", "gain", "rise", "jump", "soar",
-            "ceasefire", "deal", "peace", "cut rates", "stimulus",
-            "beat", "strong", "record high", "recovery", "easing"
-        ]
-        bearish_words = [
-            "crash", "drop", "fall", "plunge", "tariff", "war",
-            "recession", "inflation", "hike rates", "sell-off",
-            "miss", "weak", "concern", "fear", "risk", "sanctions"
-        ]
-        geo_words = ["iran", "war", "strait", "hormuz", "military",
-                     "attack", "strike", "nato", "conflict", "missile"]
-        fed_words = ["federal reserve", "fed", "powell", "rate", "fomc",
-                     "interest rate", "monetary policy"]
-        tariff_words = ["tariff", "trade war", "import tax", "liberation day",
-                        "trade deal", "sanctions", "export"]
-
-        bull_score = 0
-        bear_score = 0
+        # UW already scores sentiment — use it directly
+        bull_count = 0
+        bear_count = 0
+        neutral_count = 0
         geo_count = 0
         fed_count = 0
         tariff_count = 0
+        major_count = 0
 
-        for article in articles[:10]:
-            text = (
-                (article.get("title") or "") + " " +
-                (article.get("description") or "")
-            ).lower()
+        geo_words = [
+            "iran", "war", "strait", "hormuz", "military",
+            "attack", "strike", "nato", "conflict", "missile",
+            "ceasefire", "nuclear", "hezbollah", "houthi"
+        ]
+        fed_words = [
+            "federal reserve", "fed", "powell", "rate decision",
+            "fomc", "interest rate", "monetary policy", "rate hike",
+            "rate cut", "basis points"
+        ]
+        tariff_words = [
+            "tariff", "trade war", "import tax", "liberation day",
+            "trade deal", "sanctions", "export controls",
+            "reciprocal tariff", "trade deficit"
+        ]
 
-            for w in bullish_words:
-                if w in text:
-                    bull_score += 1
-            for w in bearish_words:
-                if w in text:
-                    bear_score += 1
+        headlines_text = []
+
+        for item in data[:20]:
+            headline = (item.get("headline") or "").lower()
+            sentiment_uw = (item.get("sentiment") or "").lower()
+            is_major = item.get("is_major", False)
+            headlines_text.append(headline)
+
+            if is_major:
+                major_count += 1
+
+            # Use UW's pre-scored sentiment
+            if sentiment_uw == "positive":
+                bull_count += 2 if is_major else 1
+            elif sentiment_uw == "negative":
+                bear_count += 2 if is_major else 1
+            else:
+                neutral_count += 1
+
+            # Keyword catalyst detection
             for w in geo_words:
-                if w in text:
+                if w in headline:
                     geo_count += 1
+                    break
             for w in fed_words:
-                if w in text:
+                if w in headline:
                     fed_count += 1
+                    break
             for w in tariff_words:
-                if w in text:
+                if w in headline:
                     tariff_count += 1
+                    break
 
-        # Determine catalyst type
+        # Determine catalyst type — priority order
         today = date.today()
         if today in FED_DATES_2026 or fed_count >= 3:
             catalyst_type = "FED"
-            catalyst_strength = min(100, fed_count * 15 + 40)
+            catalyst_strength = min(100, fed_count * 15 + 50)
         elif geo_count >= 3:
             catalyst_type = "GEO"
-            catalyst_strength = min(100, geo_count * 12 + 30)
+            catalyst_strength = min(100, geo_count * 12 + 40)
         elif tariff_count >= 3:
             catalyst_type = "TARIFF"
-            catalyst_strength = min(100, tariff_count * 12 + 30)
+            catalyst_strength = min(100, tariff_count * 12 + 40)
         elif today in OPEX_DATES:
             catalyst_type = "OPEX"
             catalyst_strength = 60
@@ -155,27 +173,38 @@ def fetch_news_sentiment():
             catalyst_type = "NONE"
             catalyst_strength = 0
 
-        # Determine sentiment
-        total = bull_score + bear_score
+        # Boost catalyst strength if multiple major headlines
+        if major_count >= 3:
+            catalyst_strength = min(100, catalyst_strength + 15)
+
+        # Determine overall sentiment from UW scores
+        total = bull_count + bear_count
         if total == 0:
             sentiment = "NEUTRAL"
             news_score = 50
-        elif bull_score > bear_score * 1.5:
+        elif bull_count > bear_count * 1.5:
             sentiment = "BULLISH"
-            news_score = min(100, int(50 + (bull_score / total) * 50))
-        elif bear_score > bull_score * 1.5:
+            news_score = min(100, int(50 + (bull_count / total) * 50))
+        elif bear_count > bull_count * 1.5:
             sentiment = "BEARISH"
-            news_score = max(0, int(50 - (bear_score / total) * 50))
+            news_score = max(0, int(50 - (bear_count / total) * 50))
         else:
             sentiment = "NEUTRAL"
             news_score = 50
 
-        # Macro override — news likely beats structure signal
+        # Macro override — news likely overrides GEX structure
         macro_override = "YES" if (
             catalyst_strength >= 60 or
-            geo_count >= 5 or
-            (catalyst_type == "FED" and catalyst_strength >= 50)
+            (catalyst_type == "GEO" and geo_count >= 4) or
+            (catalyst_type == "FED" and catalyst_strength >= 50) or
+            (catalyst_type == "TARIFF" and catalyst_strength >= 60) or
+            major_count >= 5
         ) else "NO"
+
+        # Log top headlines for console
+        print(f"📰 News: {sentiment} | Catalyst: {catalyst_type} "
+              f"({catalyst_strength}) | Override: {macro_override} | "
+              f"Major: {major_count} | Bull:{bull_count} Bear:{bear_count}")
 
         return sentiment, news_score, catalyst_type, catalyst_strength, macro_override
 
@@ -229,8 +258,8 @@ def get_intraday_features(price, vol_gex):
         gamma_wall_above = state.get("gamma_wall_above", "")
         gamma_wall_below = state.get("gamma_wall_below", "")
 
-        # Time of day
-        h = datetime.now().hour
+        # Time of day (PDT)
+        h = now_pdt().hour
         if h < 8:
             time_of_day = "EARLY"
         elif h < 11:
@@ -262,18 +291,77 @@ def get_intraday_features(price, vol_gex):
 def git_commit_log():
     """
     Auto-commits the CSV to GitHub after every EOD write.
+    Requires GITHUB_TOKEN in Railway environment variables.
     Data survives Railway redeploys permanently.
+
+    Setup in Railway:
+    Variable name: GITHUB_TOKEN
+    Value: your GitHub personal access token
+    Get one at: github.com/settings/tokens
+    Needs repo scope only
     """
     try:
         import subprocess
-        subprocess.run(["git", "add", LOG_FILE], check=True)
+
+        github_token = os.getenv("GITHUB_TOKEN", "")
+        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+
+        if not github_token:
+            print("⚠️ GITHUB_TOKEN not set — CSV not committed to GitHub")
+            print("   Add GITHUB_TOKEN to Railway environment variables")
+            print("   Get token at: github.com/settings/tokens")
+            return
+
         today_str = date.today().strftime("%Y-%m-%d")
+
+        # Configure git with token authentication
+        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", remote_url],
+            check=True, capture_output=True
+        )
+
+        # Configure git identity for the commit
+        subprocess.run(
+            ["git", "config", "user.email", "gammabot@railway.app"],
+            check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "GammaBot"],
+            check=True, capture_output=True
+        )
+
+        # Add and commit the CSV
+        subprocess.run(
+            ["git", "add", LOG_FILE],
+            check=True, capture_output=True
+        )
+
+        # Check if there's anything to commit
+        result = subprocess.run(
+            ["git", "diff", "--staged", "--quiet"],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            print("📝 No new CSV data to commit today")
+            return
+
         subprocess.run([
             "git", "commit", "-m",
             f"Auto-log: SPY GEX data {today_str}"
-        ], check=True)
-        subprocess.run(["git", "push", "origin", "main"], check=True)
+        ], check=True, capture_output=True)
+
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            check=True, capture_output=True
+        )
+
         print(f"✅ CSV committed to GitHub: {today_str}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Git commit error: {e}")
+        print("CSV data saved locally on Railway")
+        print("Check GITHUB_TOKEN has repo write access")
     except Exception as e:
         print(f"Git commit error (non-critical): {e}")
 
@@ -409,9 +497,19 @@ state = {
     "session_low": None,
 
     # Alert timing fixes
-    "last_unwind_alert_time": 0,  # epoch time of last unwind alert
-    "last_summary_time": 0,       # epoch time of last mid-session summary
-    "consolidation_gex_state": None,  # GEX state when consolidation fired
+    "last_unwind_alert_time": 0,
+    "last_summary_time": 0,
+    "consolidation_gex_state": None,
+
+    # New module state
+    "last_heartbeat": 0,
+    "doji_transition_sent": False,
+    "last_wall_alert_price": 0,
+    "current_vanna_target": None,
+    "current_charm_target": None,
+    "regime_transitions_today": 0,
+    "vwap_breaks_today": 0,
+    "session_vwap": None,
 }
 
 # OPEX dates 2026 — update quarterly
@@ -709,8 +807,8 @@ def fetch_vanna_charm():
 
 def get_vanna_charm_read(vanna_target, vanna_strength, charm_target,
                           charm_strength, price, conflict):
-    now = datetime.now()
-    minutes_since_open = (now.hour - 6) * 60 + now.minute - 30
+    pdt = now_pdt()
+    minutes_since_open = (pdt.hour - 6) * 60 + pdt.minute - 30
     vanna_window_open = minutes_since_open < 270
     mins_left = max(0, 270 - minutes_since_open)
     lines = []
@@ -750,8 +848,8 @@ def get_vanna_charm_read(vanna_target, vanna_strength, charm_target,
 # ─────────────────────────────────────────────
 def run_consolidation_check(current_price, current_iv, current_volume,
                              vanna_target, charm_target, conflict):
-    now = datetime.now()
-    mins = (now.hour - 6) * 60 + now.minute - 30
+    pdt = now_pdt()
+    mins = (pdt.hour - 6) * 60 + pdt.minute - 30
     if mins > 45 or mins < 5:
         return False, 0, []
 
@@ -941,10 +1039,9 @@ def fetch_tick_and_inventory():
         recent_vol = float(np.mean(volumes[-3:]))
         volume_surge = recent_vol > avg_vol * 1.5
 
-        # Open drive detection
-        # Pattern: large gap up/down + sustained TICK + volume surge in first 30min
-        now = datetime.now()
-        mins_since_open = (now.hour - 6) * 60 + now.minute - 30
+        # Open drive detection (PDT time)
+        pdt = now_pdt()
+        mins_since_open = (pdt.hour - 6) * 60 + pdt.minute - 30
         open_drive = False
         if mins_since_open <= 30 and volume_surge and (sustained_bull or sustained_bear):
             open_drive = True
@@ -1169,13 +1266,19 @@ def fmt(value_m):
     return f"{s}{a*1000:.0f}K"
 
 
+PDT = timezone(timedelta(hours=-7))
+
+def now_pdt():
+    """Always returns current time in PDT regardless of server timezone."""
+    return datetime.now(timezone.utc).astimezone(PDT)
+
 def is_market_open():
-    now = datetime.now()
-    if now.weekday() >= 5:
+    pdt = now_pdt()
+    if pdt.weekday() >= 5:
         return False
-    o = now.replace(hour=6, minute=30, second=0)
-    c = now.replace(hour=13, minute=0, second=0)
-    return o <= now <= c
+    o = pdt.replace(hour=6, minute=30, second=0, microsecond=0)
+    c = pdt.replace(hour=13, minute=0, second=0, microsecond=0)
+    return o <= pdt <= c
 
 
 async def _send(text):
@@ -1218,7 +1321,7 @@ def check_vwap():
     if r[0] is None:
         return
     cp, cv, pp, pv, _ = r
-    now = datetime.now().strftime("%H:%M")
+    now_str = now_pdt().strftime("%H:%M")
     bearish = "BEARISH" in gex_s
     bullish = "BULLISH" in gex_s
 
@@ -1227,7 +1330,7 @@ def check_vwap():
             alert(
                 f"🔽 VWAP CROSS — BEARISH ENTRY\n"
                 f"Price: ${round(cp,2)} | VWAP: ${round(cv,2)}\n"
-                f"Regime: {state['regime']} | Time: {now}\n"
+                f"Regime: {state['regime']} | Time: {now_str} PDT\n"
                 f"Inventory: {state['inventory_bias']}\n\n"
                 f"⚠️ Confirm candle close below VWAP before entering."
             )
@@ -1238,7 +1341,7 @@ def check_vwap():
             alert(
                 f"🔼 VWAP CROSS — BULLISH ENTRY\n"
                 f"Price: ${round(cp,2)} | VWAP: ${round(cv,2)}\n"
-                f"Regime: {state['regime']} | Time: {now}\n"
+                f"Regime: {state['regime']} | Time: {now_str} PDT\n"
                 f"Inventory: {state['inventory_bias']}\n\n"
                 f"⚠️ Confirm candle close above VWAP before entering."
             )
@@ -1249,13 +1352,279 @@ def check_vwap():
 
 
 # ─────────────────────────────────────────────
+# NEW MODULE: HEARTBEAT WATCHDOG
+# Fires every 60 min during market hours
+# regardless of all other alert flags
+# So you always know bot is alive
+# ─────────────────────────────────────────────
+def check_heartbeat():
+    """
+    Sends a simple alive ping every 60 minutes
+    during market hours. Prevents silent failures.
+    """
+    if not is_market_open():
+        return
+    try:
+        now_epoch = time.time()
+        last_beat = state.get("last_heartbeat", 0)
+        if now_epoch - last_beat < 3600:  # 60 min
+            return
+
+        r = get_vwap()
+        if r[0] is None:
+            return
+        cp, cv, _, _, _ = r
+        now_str = now_pdt().strftime("%H:%M")
+        regime = state.get("regime", "UNKNOWN")
+        gex_state = state.get("previous_gex_state", "UNKNOWN")
+        conv = state.get("last_conviction_score", 0)
+        vwap_dist = round(cp - cv, 2)
+        vwap_side = "above" if vwap_dist > 0 else "below"
+
+        alert(
+            f"💓 BOT ALIVE — SPY\n"
+            f"{'─'*30}\n"
+            f"{now_str} PDT | ${round(cp,2)}\n\n"
+            f"Regime: {regime}\n"
+            f"GEX: {gex_state}\n"
+            f"Conviction: {conv}/100\n"
+            f"VWAP: ${round(cv,2)} "
+            f"(${abs(vwap_dist):.2f} {vwap_side})\n\n"
+            f"Bot running normally ✅"
+        )
+        state["last_heartbeat"] = now_epoch
+        print(f"💓 Heartbeat sent at {now_str} PDT")
+
+    except Exception as e:
+        print(f"Heartbeat error: {e}")
+
+
+# ─────────────────────────────────────────────
+# NEW MODULE: DOJI TRANSITION DETECTOR
+# Catches the exact setup you described:
+# Price near VWAP + Vol GEX decelerating
+# + small candle body = transition forming
+# ─────────────────────────────────────────────
+def check_doji_transition():
+    """
+    Detects when a bearish/bullish trend
+    is transitioning at VWAP.
+
+    Three conditions must align:
+    1. Price within $0.75 of VWAP (doji zone)
+    2. Vol GEX rate of change decelerating
+       (negative but getting less negative
+        OR positive but getting less positive)
+    3. Vol GEX and OI GEX behavior consistent
+       with regime flip starting
+
+    This is the "warning before the warning"
+    — fires BEFORE the regime transition
+    so you can prepare your entry
+    """
+    if not is_market_open():
+        return
+    try:
+        r = get_vwap()
+        if r[0] is None:
+            return
+        cp, cv, pp, pv, _ = r
+
+        # Condition 1: Price within $0.75 of VWAP
+        vwap_dist = abs(cp - cv)
+        if vwap_dist > 0.75:
+            state["doji_transition_sent"] = False
+            return
+
+        # Condition 2: Vol GEX decelerating
+        history = state.get("vol_gex_history", [])
+        if len(history) < 3:
+            return
+
+        recent = history[-3:]
+        vol_gex_current = recent[-1]
+        vol_gex_prev = recent[-2]
+        vol_gex_older = recent[-3]
+
+        # Rate of change slowing down
+        roc_recent = abs(vol_gex_current) - abs(vol_gex_prev)
+        roc_older = abs(vol_gex_prev) - abs(vol_gex_older)
+        decelerating = roc_older < 0 and roc_recent > roc_older
+
+        if not decelerating:
+            return
+
+        # Condition 3: Don't fire if already in transition/unwind
+        regime = state.get("regime", "")
+        if regime in ["HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM"]:
+            return
+
+        # Already sent for this doji formation
+        if state.get("doji_transition_sent"):
+            return
+
+        now_str = now_pdt().strftime("%H:%M")
+        prev_regime = state.get("previous_regime", "")
+
+        # Determine likely transition direction
+        if vol_gex_current < 0 and roc_recent > 0:
+            # Negative but improving = bullish transition
+            direction = "BEARISH → BULLISH"
+            action = "Watch for Vol GEX flip positive\n→ Calls on VWAP break above"
+            emoji = "🔄"
+        elif vol_gex_current > 0 and roc_recent < 0:
+            # Positive but deteriorating = bearish transition
+            direction = "BULLISH → BEARISH"
+            action = "Watch for Vol GEX flip negative\n→ Puts on VWAP break below"
+            emoji = "🔄"
+        else:
+            direction = "CONSOLIDATING"
+            action = "No clear direction yet\n→ Wait for Vol GEX commitment"
+            emoji = "⚠️"
+
+        vol_fmt_current = fmt(vol_gex_current / (650 * 6.31) / 1e6)
+        vol_fmt_prev = fmt(vol_gex_prev / (650 * 6.31) / 1e6)
+
+        alert(
+            f"{emoji} DOJI TRANSITION FORMING — SPY\n"
+            f"{'─'*35}\n"
+            f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
+            f"VWAP: ${round(cv,2)} "
+            f"(only ${vwap_dist:.2f} away)\n\n"
+            f"🔍 WHAT IS HAPPENING\n"
+            f"Transition: {direction}\n"
+            f"Vol GEX decelerating:\n"
+            f"  Previous: {vol_fmt_prev}\n"
+            f"  Current:  {vol_fmt_current}\n"
+            f"  → Momentum losing steam\n\n"
+            f"📊 CANDLE SIGNAL\n"
+            f"Doji forming at VWAP\n"
+            f"Price indecision = institutions\n"
+            f"pausing before next move\n\n"
+            f"🎯 ACTION\n"
+            f"{action}\n\n"
+            f"⚠️ NOT A TRADE SIGNAL YET\n"
+            f"Wait for Vol GEX to confirm direction\n"
+            f"Next scheduled reading will clarify"
+        )
+        state["doji_transition_sent"] = True
+        print(f"Doji transition alert: {direction} at {now_str} PDT")
+
+    except Exception as e:
+        print(f"Doji transition error: {e}")
+
+
+# ─────────────────────────────────────────────
+# NEW MODULE: GAMMA WALL APPROACH / TP ALERT
+# Fires when price approaches a major gamma
+# wall — tells you TP zone is near
+# Solves the "missed 655-657 exit" problem
+# ─────────────────────────────────────────────
+def check_gamma_wall_approach():
+    """
+    Detects when price is within $1.50 of
+    a significant gamma wall and alerts:
+    - If approaching from below (bounce):
+      → Take profits on calls, watch for rejection
+    - If approaching from above (dump):
+      → Take profits on puts, watch for bounce
+
+    Uses vanna targets and OI concentration
+    as wall estimates.
+    """
+    if not is_market_open():
+        return
+    try:
+        r = get_vwap()
+        if r[0] is None:
+            return
+        cp, cv, _, _, _ = r
+
+        vanna_target = state.get("current_vanna_target")
+        charm_target = state.get("current_charm_target")
+        regime = state.get("previous_regime", "")
+        gex_state = state.get("previous_gex_state", "")
+        now_str = now_pdt().strftime("%H:%M")
+
+        # Don't spam — only fire once per wall per session
+        last_wall_alert = state.get("last_wall_alert_price", 0)
+        if abs(cp - last_wall_alert) < 2.0:
+            return
+
+        # Check vanna target approach
+        if vanna_target:
+            dist_to_vanna = vanna_target - cp
+            abs_dist = abs(dist_to_vanna)
+
+            if abs_dist <= 1.5:
+                approaching_from = "below" if dist_to_vanna > 0 else "above"
+
+                if approaching_from == "below":
+                    # Price running UP toward vanna target
+                    # Tell user to take profits on calls
+                    alert(
+                        f"🎯 VANNA TARGET APPROACHING — SPY\n"
+                        f"{'─'*35}\n"
+                        f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
+                        f"Vanna target: ${vanna_target} "
+                        f"(${abs_dist:.2f} away)\n\n"
+                        f"💰 PROFIT ZONE — CALLS\n"
+                        f"If holding calls from lower:\n"
+                        f"→ THIS IS YOUR EXIT ZONE\n"
+                        f"→ Sell calls between "
+                        f"${round(vanna_target-0.5,0)}-${vanna_target}\n"
+                        f"→ Do NOT hold past the target\n\n"
+                        f"⚠️ WHAT HAPPENS AT THE WALL\n"
+                        f"Charm force reverses at ${vanna_target}\n"
+                        f"MMs start selling delta above here\n"
+                        f"Rally stalls or reverses\n\n"
+                        f"🔄 AFTER TARGET HIT\n"
+                        f"Watch Vol GEX — if flips negative\n"
+                        f"→ Put re-entry at ${vanna_target}"
+                    )
+                    state["last_wall_alert_price"] = cp
+                    print(f"Vanna target approach alert (from below) at {now_str}")
+
+                elif approaching_from == "above":
+                    # Price falling DOWN toward vanna target
+                    # Tell user to take profits on puts
+                    alert(
+                        f"🎯 SUPPORT ZONE APPROACHING — SPY\n"
+                        f"{'─'*35}\n"
+                        f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
+                        f"Vanna support: ${vanna_target} "
+                        f"(${abs_dist:.2f} away)\n\n"
+                        f"💰 PROFIT ZONE — PUTS\n"
+                        f"If holding puts from higher:\n"
+                        f"→ Consider partial profit here\n"
+                        f"→ Vanna support at ${vanna_target} "
+                        f"may cause bounce\n"
+                        f"→ Sell half, keep half for break\n\n"
+                        f"⚠️ WHAT HAPPENS AT THE WALL\n"
+                        f"Charm +{round(abs(charm_target or 0)/1e6,0)}M "
+                        f"support at this level\n"
+                        f"MMs forced to buy delta here\n"
+                        f"Puts may stall or reverse\n\n"
+                        f"🔄 IF WALL BREAKS\n"
+                        f"Hold remaining puts\n"
+                        f"Next target: ${round(vanna_target - 5, 0)}"
+                    )
+                    state["last_wall_alert_price"] = cp
+                    print(f"Support approach alert (from above) at {now_str}")
+
+    except Exception as e:
+        print(f"Gamma wall approach error: {e}")
+
+
+# ─────────────────────────────────────────────
 # CONSOLIDATION JOB
 # ─────────────────────────────────────────────
 def check_consolidation_job():
     if not is_market_open():
         return
-    now = datetime.now()
-    mins = (now.hour - 6) * 60 + now.minute - 30
+    pdt = now_pdt()
+    now = pdt
+    mins = (pdt.hour - 6) * 60 + pdt.minute - 30
     if mins > 45 or mins < 5 or state["consolidation_alert_sent"]:
         return
 
@@ -1375,6 +1744,10 @@ def eod_autofill(close_price):
         else:
             correct = ""
 
+        # Pull session stats BEFORE the rows loop
+        session_high = state.get("session_high") or close_price
+        session_low = state.get("session_low") or close_price
+
         # Update today's rows that have blank outcome columns
         updated = 0
         for r in rows:
@@ -1396,10 +1769,8 @@ def eod_autofill(close_price):
         git_commit_log()
 
         # Send end of day summary to Telegram
-        now_str = datetime.now().strftime("%H:%M")
+        now_str = now_pdt().strftime("%H:%M")
         signal_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
-        session_high = state.get("session_high") or close_price
-        session_low = state.get("session_low") or close_price
         max_up = round(session_high - open_price, 2)
         max_down = round(open_price - session_low, 2)
 
@@ -1430,8 +1801,9 @@ def eod_autofill(close_price):
 # MAIN JOB — unified
 # ─────────────────────────────────────────────
 def run_job():
-    now_str = datetime.now().strftime("%H:%M")
-    print(f"\n{'='*60}\nJob: {now_str}\n{'='*60}")
+    pdt = now_pdt()
+    now_str = pdt.strftime("%H:%M")
+    print(f"\n{'='*60}\nJob: {now_str} PDT\n{'='*60}")
 
     try:
         # ── Core GEX (original gamma bot) ──
@@ -1462,6 +1834,10 @@ def run_job():
         vix_spot, vvix_val, vix_term, term_sig, vix_sig, vvix_sig = fetch_vix_data()
         vt, vs, ct, cs, conflict = fetch_vanna_charm()
         vc_text, vanna_window = get_vanna_charm_read(vt, vs, ct, cs, price, conflict)
+
+        # Store for gamma wall checker
+        state["current_vanna_target"] = vt
+        state["current_charm_target"] = ct
         unwind_det, unwind_score, unwind_sigs, flow_dir = fetch_hedge_unwind_signals()
         regime, reg_conf = detect_regime(oi_gex, vol_gex, state["vol_gex_history"])
         reg_signal = get_regime_signal(regime, reg_conf, oi_b, vol_b)
@@ -1613,7 +1989,8 @@ def run_job():
             )
 
         # ── MORNING VELOCITY REPORT ──
-        h, m = datetime.now().hour, datetime.now().minute
+        pdt_now = now_pdt()
+        h, m = pdt_now.hour, pdt_now.minute
 
         # FIX 1: Morning report fires once at open
         # BUT re-fires if conviction score changes significantly
@@ -1715,6 +2092,9 @@ def run_job():
             state["regime_transitions_today"] = 0
             state["vwap_breaks_today"] = 0
             state["session_vwap"] = None
+            state["doji_transition_sent"] = False
+            state["last_wall_alert_price"] = 0
+            state["last_heartbeat"] = 0
 
         # Update state
         state["previous_gex_state"] = gex_state
@@ -1799,23 +2179,26 @@ def check_telegram_commands():
 # ─────────────────────────────────────────────
 # SCHEDULE (original gamma bot times preserved)
 # ─────────────────────────────────────────────
-schedule.every().day.at("06:00").do(run_job)
-schedule.every().day.at("06:30").do(run_job)
-schedule.every().day.at("07:00").do(run_job)
-schedule.every().day.at("07:45").do(run_job)
-schedule.every().day.at("08:30").do(run_job)
-schedule.every().day.at("09:15").do(run_job)
-schedule.every().day.at("10:00").do(run_job)
-schedule.every().day.at("10:45").do(run_job)
-schedule.every().day.at("11:30").do(run_job)
-schedule.every().day.at("12:15").do(run_job)
-schedule.every().day.at("13:00").do(run_job)
+schedule.every().day.at("13:00").do(run_job)  # 6:00am PDT
+schedule.every().day.at("13:30").do(run_job)  # 6:30am PDT
+schedule.every().day.at("14:00").do(run_job)  # 7:00am PDT
+schedule.every().day.at("14:45").do(run_job)  # 7:45am PDT
+schedule.every().day.at("15:30").do(run_job)  # 8:30am PDT
+schedule.every().day.at("16:15").do(run_job)  # 9:15am PDT
+schedule.every().day.at("17:00").do(run_job)  # 10:00am PDT
+schedule.every().day.at("17:45").do(run_job)  # 10:45am PDT
+schedule.every().day.at("18:30").do(run_job)  # 11:30am PDT
+schedule.every().day.at("19:15").do(run_job)  # 12:15pm PDT
+schedule.every().day.at("20:00").do(run_job)  # 1:00pm PDT (EOD)
 
 schedule.every(5).minutes.do(check_vwap)
 schedule.every(5).minutes.do(check_consolidation_job)
 schedule.every(5).minutes.do(check_telegram_commands)
+schedule.every(5).minutes.do(check_doji_transition)
+schedule.every(5).minutes.do(check_gamma_wall_approach)
+schedule.every(60).minutes.do(check_heartbeat)
 
-print("SPY UNIFIED BOT v4.0 — ML READY")
+print("SPY UNIFIED BOT v4.1 — ML READY")
 print("=" * 60)
 print("Modules:")
 print("  1. GEX Core")
@@ -1830,15 +2213,12 @@ print("  9. TICK + Inventory Precision")
 print(" 10. Calendar / Quarter System")
 print(" 11. Unified Conviction Scorer")
 print(" 12. ML Data Logger — FULLY AUTOMATED")
-print("     → Intraday features: auto")
-print("     → News sentiment: auto")
-print("     → Catalyst detection: auto")
-print("     → Outcomes: auto at EOD")
-print("     → GitHub commit: auto")
-print("     → /notes command: optional")
+print(" 13. Heartbeat Watchdog (60min)")
+print(" 14. Doji Transition Detector")
+print(" 15. Gamma Wall / TP Zone Alert")
 print("=" * 60)
-print("Add NEWS_API_KEY to Railway for news sentiment")
-print("Get free key at: newsapi.org")
+print("Timezone: All times PDT (UTC-7)")
+print("Schedule: 6:00am - 1:00pm PDT")
 print("=" * 60)
 init_log()
 run_job()
