@@ -15,11 +15,55 @@ from telegram import Bot
 load_dotenv()
 
 # ─────────────────────────────────────────────
-# LOGGING SYSTEM v2 — Full ML Dataset
+# ENVIRONMENT VARIABLES
+# ─────────────────────────────────────────────
+UW_TOKEN = os.getenv("UW_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+TICKER = "SPY"
+
+# Anthropic client — used for AI signal verification + alert writing
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+# ─────────────────────────────────────────────
+# TIMEZONE HELPER — all times PDT (UTC-7)
+# ─────────────────────────────────────────────
+PDT = timezone(timedelta(hours=-7))
+
+def now_pdt():
+    """Always returns current time in PDT regardless of server timezone."""
+    return datetime.now(timezone.utc).astimezone(PDT)
+
+def is_market_open():
+    pdt = now_pdt()
+    if pdt.weekday() >= 5:
+        return False
+    o = pdt.replace(hour=6, minute=30, second=0, microsecond=0)
+    c = pdt.replace(hour=13, minute=0, second=0, microsecond=0)
+    return o <= pdt <= c
+
+def is_overnight_window():
+    """
+    Returns True during overnight monitoring window:
+    - Weekday evenings: 1pm PDT close → 6am PDT next day
+    - Weekend: Saturday + Sunday (institutions positioning)
+    - Specifically valuable: 6pm-11pm PDT (Trump speeches, Fed announcements,
+      earnings, geopolitical events, futures moves)
+    """
+    pdt = now_pdt()
+    h = pdt.hour
+    # Weekend = always overnight monitoring
+    if pdt.weekday() >= 5:
+        return True
+    # Weekday after close (1pm PDT) and before open (6am PDT)
+    return h >= 13 or h < 6
+
+# ─────────────────────────────────────────────
+# LOGGING SYSTEM v3 — Full ML Dataset
 # Everything logged automatically
 # Only "notes" column is optional for you
 # ─────────────────────────────────────────────
-
 LOG_FILE = "spy_gex_log.csv"
 LOG_HEADERS = [
     "date", "time", "price",
@@ -32,35 +76,26 @@ LOG_HEADERS = [
     "unwind_score", "open_drive",
     "vanna_target", "charm_target",
     "calendar_flags", "days_to_opex",
-    # Intraday ML features — all auto
-    "vwap_distance",
-    "price_vs_open",
-    "session_range",
-    "vol_gex_velocity",
-    "vol_gex_direction",
-    "regime_transitions",
-    "vwap_breaks",
-    "gamma_wall_above",
-    "gamma_wall_below",
-    "time_of_day",
-    # Catalyst ML features — all auto
-    "news_sentiment",
-    "news_score",
-    "catalyst_type",
-    "catalyst_strength",
-    "macro_override",
-    # Outcomes — all auto at EOD
-    "outcome_direction",
-    "outcome_points",
-    "signal_correct",
-    "max_move_up",
-    "max_move_down",
-    # AI verification — auto via Claude API
-    "claude_verdict",
-    "claude_confidence",
-    "claude_reasoning",
-    "combined_score",
-    # Only this needs you — optional
+    # Intraday ML features
+    "vwap_distance", "price_vs_open", "session_range",
+    "vol_gex_velocity", "vol_gex_direction",
+    "regime_transitions", "vwap_breaks",
+    "gamma_wall_above", "gamma_wall_below", "time_of_day",
+    # Catalyst ML features
+    "news_sentiment", "news_score",
+    "catalyst_type", "catalyst_strength", "macro_override",
+    # Overnight features — new
+    "session_type",        # MARKET / OVERNIGHT / WEEKEND
+    "futures_direction",   # UP / DOWN / FLAT (ES futures overnight)
+    "overnight_vix_move",  # VIX change since close
+    "overnight_news_flag", # MAJOR_EVENT / MINOR / NONE
+    # Outcomes — auto at EOD
+    "outcome_direction", "outcome_points",
+    "signal_correct", "max_move_up", "max_move_down",
+    # AI verification
+    "claude_verdict", "claude_confidence",
+    "claude_reasoning", "combined_score",
+    # Optional
     "notes"
 ]
 
@@ -72,75 +107,181 @@ FED_DATES_2026 = [
     date(2026, 11, 5), date(2026, 12, 16),
 ]
 
+OPEX_DATES = [
+    date(2026, 1, 16), date(2026, 2, 20), date(2026, 3, 21),
+    date(2026, 4, 17), date(2026, 5, 15), date(2026, 6, 20),
+    date(2026, 7, 17), date(2026, 8, 21), date(2026, 9, 18),
+    date(2026, 10, 16), date(2026, 11, 20), date(2026, 12, 18),
+]
+
+QUARTER_END_DATES = [
+    date(2026, 3, 31), date(2026, 6, 30),
+    date(2026, 9, 30), date(2026, 12, 31),
+]
+
+# ─────────────────────────────────────────────
+# GLOBAL STATE
+# ─────────────────────────────────────────────
+state = {
+    # Core gamma bot state
+    "previous_gex_state": None,
+    "previous_ratio": None,
+    "vwap_alert_sent": False,
+    # Intelligence state
+    "previous_vol_gex": None,
+    "previous_oi_gex": None,
+    "vol_gex_history": [],
+    "regime": None,
+    "previous_regime": None,
+    "velocity_score_sent": False,
+    "consolidation_alert_sent": False,
+    "hedge_unwind_alert_sent": False,
+    "open_price": None,
+    "open_iv": None,
+    "open_volume": None,
+    "open_time_prices": [],
+    "last_conviction_score": None,
+    # Precision tracking
+    "tick_history": [],
+    "vix_history": [],
+    "inventory_bias": "NEUTRAL",
+    "open_drive_detected": False,
+    "session_high": None,
+    "session_low": None,
+    # Alert timing
+    "last_unwind_alert_time": 0,
+    "last_summary_time": 0,
+    "consolidation_gex_state": None,
+    # New module state
+    "last_heartbeat": 0,
+    "doji_transition_sent": False,
+    "last_wall_alert_price": 0,
+    "current_vanna_target": None,
+    "current_charm_target": None,
+    "regime_transitions_today": 0,
+    "vwap_breaks_today": 0,
+    "session_vwap": None,
+    "eod_fired_today": False,
+    # Overnight state — new
+    "overnight_report_sent": False,
+    "last_overnight_check": 0,
+    "overnight_gex_snapshot": None,   # GEX at close for comparison
+    "overnight_vix_close": None,      # VIX at close for comparison
+    "overnight_alerts_today": 0,      # cap overnight alerts
+    "last_news_sentiment": "NEUTRAL",
+    "last_catalyst_type": "NONE",
+    "last_macro_override": "NO",
+}
+
+
+# ─────────────────────────────────────────────
+# PERSISTENT STORAGE — GitHub auto-commit
+# Survives Railway redeployments
+# Requires GITHUB_TOKEN in Railway vars
+# ─────────────────────────────────────────────
+def git_commit_log():
+    """
+    Auto-commits the CSV to GitHub after every EOD write.
+    Data survives Railway redeploys permanently.
+
+    Setup: Add GITHUB_TOKEN to Railway environment variables.
+    Get token at: github.com/settings/tokens (repo scope only)
+    """
+    try:
+        import subprocess
+
+        github_token = os.getenv("GITHUB_TOKEN", "")
+        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+
+        if not github_token:
+            print("⚠️ GITHUB_TOKEN not set — CSV saved locally only")
+            print("   Add GITHUB_TOKEN to Railway vars to persist data")
+            print("   Get at: github.com/settings/tokens")
+            return
+
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
+
+        subprocess.run(["git", "remote", "set-url", "origin", remote_url],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "gammabot@railway.app"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "GammaBot"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "add", LOG_FILE],
+                       check=True, capture_output=True)
+
+        result = subprocess.run(["git", "diff", "--staged", "--quiet"],
+                                capture_output=True)
+        if result.returncode == 0:
+            print("📝 No new CSV data to commit")
+            return
+
+        subprocess.run(["git", "commit", "-m",
+                        f"Auto-log: SPY GEX data {today_str}"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"],
+                       check=True, capture_output=True)
+        print(f"✅ CSV committed to GitHub: {today_str}")
+
+    except Exception as e:
+        print(f"Git commit error (non-critical): {e}")
+        print("CSV data saved locally — add GITHUB_TOKEN to persist")
+
+
+def init_log():
+    """Create CSV file with headers if it doesn't exist."""
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+            writer.writeheader()
+        print(f"Log file created: {LOG_FILE}")
+
+
+# ─────────────────────────────────────────────
+# NEWS SENTIMENT — UW API
+# ─────────────────────────────────────────────
 def fetch_news_sentiment():
     """
     Pulls latest market headlines from UW's news endpoint.
-    Uses the same UW_TOKEN already in Railway — no new credentials.
-    UW pre-scores sentiment so no keyword matching needed.
+    UW pre-scores sentiment — no keyword matching needed.
     Returns: sentiment, score, catalyst_type, strength, macro_override
     """
     try:
         if not UW_TOKEN:
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
-        headers = {
-            "Authorization": f"Bearer {UW_TOKEN}",
-            "Accept": "application/json"
-        }
-
-        # Pull major market news — broad market view
+        headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
         url = "https://api.unusualwhales.com/api/news/headlines"
-        params = {
-            "major_only": "true",
-            "limit": 20
-        }
+        params = {"major_only": "true", "limit": 20}
         r = requests.get(url, headers=headers, params=params, timeout=8)
 
         if r.status_code != 200:
-            print(f"UW news error: {r.status_code}")
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
         data = r.json().get("data", [])
         if not data:
             return "NEUTRAL", 50, "NONE", 0, "NO"
 
-        # UW already scores sentiment — use it directly
-        bull_count = 0
-        bear_count = 0
-        neutral_count = 0
-        geo_count = 0
-        fed_count = 0
-        tariff_count = 0
-        major_count = 0
+        bull_count = bear_count = neutral_count = 0
+        geo_count = fed_count = tariff_count = major_count = 0
 
-        geo_words = [
-            "iran", "war", "strait", "hormuz", "military",
-            "attack", "strike", "nato", "conflict", "missile",
-            "ceasefire", "nuclear", "hezbollah", "houthi"
-        ]
-        fed_words = [
-            "federal reserve", "fed", "powell", "rate decision",
-            "fomc", "interest rate", "monetary policy", "rate hike",
-            "rate cut", "basis points"
-        ]
-        tariff_words = [
-            "tariff", "trade war", "import tax", "liberation day",
-            "trade deal", "sanctions", "export controls",
-            "reciprocal tariff", "trade deficit"
-        ]
-
-        headlines_text = []
+        geo_words = ["iran", "war", "strait", "hormuz", "military", "attack",
+                     "strike", "nato", "conflict", "missile", "ceasefire",
+                     "nuclear", "hezbollah", "houthi"]
+        fed_words = ["federal reserve", "fed", "powell", "rate decision", "fomc",
+                     "interest rate", "monetary policy", "rate hike", "rate cut"]
+        tariff_words = ["tariff", "trade war", "import tax", "liberation day",
+                        "trade deal", "sanctions", "reciprocal tariff"]
 
         for item in data[:20]:
             headline = (item.get("headline") or "").lower()
             sentiment_uw = (item.get("sentiment") or "").lower()
             is_major = item.get("is_major", False)
-            headlines_text.append(headline)
 
             if is_major:
                 major_count += 1
 
-            # Use UW's pre-scored sentiment
             if sentiment_uw == "positive":
                 bull_count += 2 if is_major else 1
             elif sentiment_uw == "negative":
@@ -148,7 +289,6 @@ def fetch_news_sentiment():
             else:
                 neutral_count += 1
 
-            # Keyword catalyst detection
             for w in geo_words:
                 if w in headline:
                     geo_count += 1
@@ -162,7 +302,6 @@ def fetch_news_sentiment():
                     tariff_count += 1
                     break
 
-        # Determine catalyst type — priority order
         today = date.today()
         if today in FED_DATES_2026 or fed_count >= 3:
             catalyst_type = "FED"
@@ -180,11 +319,9 @@ def fetch_news_sentiment():
             catalyst_type = "NONE"
             catalyst_strength = 0
 
-        # Boost catalyst strength if multiple major headlines
         if major_count >= 3:
             catalyst_strength = min(100, catalyst_strength + 15)
 
-        # Determine overall sentiment from UW scores
         total = bull_count + bear_count
         if total == 0:
             sentiment = "NEUTRAL"
@@ -199,16 +336,13 @@ def fetch_news_sentiment():
             sentiment = "NEUTRAL"
             news_score = 50
 
-        # Macro override — news likely overrides GEX structure
         macro_override = "YES" if (
             catalyst_strength >= 60 or
             (catalyst_type == "GEO" and geo_count >= 4) or
             (catalyst_type == "FED" and catalyst_strength >= 50) or
-            (catalyst_type == "TARIFF" and catalyst_strength >= 60) or
             major_count >= 5
         ) else "NO"
 
-        # Log top headlines for console
         print(f"📰 News: {sentiment} | Catalyst: {catalyst_type} "
               f"({catalyst_strength}) | Override: {macro_override} | "
               f"Major: {major_count} | Bull:{bull_count} Bear:{bear_count}")
@@ -220,21 +354,476 @@ def fetch_news_sentiment():
         return "NEUTRAL", 50, "NONE", 0, "NO"
 
 
-def get_intraday_features(price, vol_gex):
+# ─────────────────────────────────────────────
+# OVERNIGHT MONITORING ENGINE
+# Tracks what institutions are doing after hours:
+# - ES futures direction and magnitude
+# - VIX change since close (fear building?)
+# - Options flow on the overnight session
+# - News catalyst detection
+# - GEX snapshot comparison
+# ─────────────────────────────────────────────
+def fetch_overnight_data():
     """
-    Calculates intraday ML features automatically from session state.
-    No manual input required.
+    Fetches data relevant to overnight institutional positioning.
+    Returns dict with futures, VIX change, news, and GEX if available.
     """
     try:
-        # VWAP distance
+        result = {
+            "futures_price": None,
+            "futures_change_pct": None,
+            "futures_direction": "FLAT",
+            "vix_current": None,
+            "vix_change": None,
+            "vix_direction": "STABLE",
+            "news_sentiment": "NEUTRAL",
+            "catalyst_type": "NONE",
+            "catalyst_strength": 0,
+            "macro_override": "NO",
+            "overnight_news_flag": "NONE",
+            "gex_available": False,
+            "oi_gex": None,
+            "vol_gex": None,
+        }
+
+        # ES futures via yfinance (^GSPC is S&P, ES=F is futures)
+        try:
+            es = yf.Ticker("ES=F").history(period="2d", interval="5m")
+            if not es.empty:
+                if isinstance(es.columns, pd.MultiIndex):
+                    es.columns = es.columns.get_level_values(0)
+                current_price = float(es["Close"].iloc[-1])
+                # Compare to yesterday's close (last regular session close)
+                # Find close around 4pm ET (1pm PDT)
+                prev_close_candidates = es[es.index.hour == 20]  # 1pm PDT = 8pm UTC
+                if not prev_close_candidates.empty:
+                    prev_close = float(prev_close_candidates["Close"].iloc[-1])
+                else:
+                    prev_close = float(es["Close"].iloc[0])
+                change_pct = ((current_price - prev_close) / prev_close) * 100
+                result["futures_price"] = round(current_price, 2)
+                result["futures_change_pct"] = round(change_pct, 2)
+                if change_pct > 0.3:
+                    result["futures_direction"] = "UP"
+                elif change_pct < -0.3:
+                    result["futures_direction"] = "DOWN"
+                else:
+                    result["futures_direction"] = "FLAT"
+        except Exception as e:
+            print(f"Futures fetch error: {e}")
+
+        # VIX overnight
+        try:
+            vix = yf.Ticker("^VIX").history(period="2d", interval="5m")
+            if not vix.empty:
+                if isinstance(vix.columns, pd.MultiIndex):
+                    vix.columns = vix.columns.get_level_values(0)
+                vix_current = float(vix["Close"].iloc[-1])
+                result["vix_current"] = round(vix_current, 2)
+
+                # Compare to close snapshot if we have it
+                vix_at_close = state.get("overnight_vix_close")
+                if vix_at_close:
+                    vix_change = round(vix_current - vix_at_close, 2)
+                    result["vix_change"] = vix_change
+                    if vix_change > 1.5:
+                        result["vix_direction"] = "RISING"
+                    elif vix_change < -1.5:
+                        result["vix_direction"] = "FALLING"
+                    else:
+                        result["vix_direction"] = "STABLE"
+        except Exception as e:
+            print(f"VIX overnight error: {e}")
+
+        # News overnight — same UW endpoint
+        news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = \
+            fetch_news_sentiment()
+        result["news_sentiment"] = news_sentiment
+        result["catalyst_type"] = catalyst_type
+        result["catalyst_strength"] = catalyst_strength
+        result["macro_override"] = macro_override
+
+        # Overnight news significance
+        if macro_override == "YES" and catalyst_strength >= 70:
+            result["overnight_news_flag"] = "MAJOR_EVENT"
+        elif catalyst_strength >= 40:
+            result["overnight_news_flag"] = "MINOR"
+        else:
+            result["overnight_news_flag"] = "NONE"
+
+        # GEX from UW (sometimes available overnight for next session)
+        try:
+            url = f"https://api.unusualwhales.com/api/stock/{TICKER}/spot-exposures"
+            headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
+            r = requests.get(url, headers=headers, timeout=10)
+            data = r.json().get("data", [])
+            if data:
+                latest = data[-1]
+                oi_gex = float(latest.get("gamma_per_one_percent_move_oi", 0))
+                vol_gex = float(latest.get("gamma_per_one_percent_move_vol", 0))
+                if oi_gex != 0:
+                    result["gex_available"] = True
+                    result["oi_gex"] = oi_gex
+                    result["vol_gex"] = vol_gex
+        except Exception as e:
+            print(f"Overnight GEX error: {e}")
+
+        return result
+
+    except Exception as e:
+        print(f"Overnight data error: {e}")
+        return {}
+
+
+def write_overnight_alert_with_claude(overnight_data, alert_type="overnight_update"):
+    """
+    Claude writes the overnight alert in plain English.
+    Explains what institutions are doing and what it means for tomorrow.
+    """
+    if not anthropic_client:
+        return None
+
+    try:
+        pdt = now_pdt()
+        now_str = pdt.strftime("%H:%M")
+        day_name = pdt.strftime("%A")
+
+        futures_dir = overnight_data.get("futures_direction", "FLAT")
+        futures_chg = overnight_data.get("futures_change_pct", 0)
+        vix_current = overnight_data.get("vix_current", "N/A")
+        vix_change = overnight_data.get("vix_change", 0)
+        vix_dir = overnight_data.get("vix_direction", "STABLE")
+        news_sentiment = overnight_data.get("news_sentiment", "NEUTRAL")
+        catalyst_type = overnight_data.get("catalyst_type", "NONE")
+        catalyst_strength = overnight_data.get("catalyst_strength", 0)
+        macro_override = overnight_data.get("macro_override", "NO")
+        news_flag = overnight_data.get("overnight_news_flag", "NONE")
+        gex_available = overnight_data.get("gex_available", False)
+        oi_gex = overnight_data.get("oi_gex")
+        vol_gex = overnight_data.get("vol_gex")
+
+        gex_context = ""
+        if gex_available and oi_gex and vol_gex:
+            oi_b = round(oi_gex / 1e9, 2)
+            vol_b = round(vol_gex / 1e9, 2)
+            gex_context = f"\nOvernight GEX snapshot: OI={oi_b}B, Vol={vol_b}B"
+
+        vix_close = state.get("overnight_vix_close", "unknown")
+        gex_close = state.get("overnight_gex_snapshot", "unknown")
+
+        alert_prompts = {
+            "overnight_update": f"""You are writing an overnight market update for a SPY 0DTE options trader in California.
+Time: {now_str} PDT ({day_name})
+
+Overnight data:
+- ES Futures: {futures_dir} {futures_chg:+.2f}%
+- VIX: {vix_current} ({vix_dir}, change: {vix_change:+.2f} since close)
+- VIX at close: {vix_close}
+- News sentiment: {news_sentiment}
+- Catalyst: {catalyst_type} (strength: {catalyst_strength}/100)
+- Macro override active: {macro_override}
+- News significance: {news_flag}
+{gex_context}
+
+Write a brief overnight update. Rules:
+- Max 8 lines total
+- What are institutions doing right now and why
+- Is fear building (VIX rising) or fear leaving (VIX falling)?
+- What does futures direction tell you about tomorrow's open?
+- One sentence on what to watch when market opens
+- Plain English — write like a trader, not a textbook
+- 1-2 emojis max
+- End with: tomorrow's early bias (BULLISH / BEARISH / NEUTRAL)""",
+
+            "major_overnight_event": f"""You are writing an URGENT overnight alert for a SPY 0DTE options trader in California.
+Time: {now_str} PDT — MAJOR EVENT DETECTED
+
+Overnight data:
+- ES Futures: {futures_dir} {futures_chg:+.2f}%
+- VIX: {vix_current} ({vix_dir}, change: {vix_change:+.2f})
+- Catalyst: {catalyst_type} (strength: {catalyst_strength}/100)
+- News sentiment: {news_sentiment}
+- Macro override: {macro_override}
+- News significance: {news_flag}
+{gex_context}
+
+Write an urgent overnight alert. Rules:
+- Max 8 lines
+- Line 1: what the major event is and why it matters
+- Lines 2-3: what it does to tomorrow's open mechanically
+- Lines 4-5: what to do — wait, prepare puts, prepare calls
+- Line 6: the risk — could this reverse?
+- 2 emojis max
+- Urgent but not panicked tone"""
+        }
+
+        prompt = alert_prompts.get(alert_type, alert_prompts["overnight_update"])
+
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        text = response.content[0].text.strip()
+        print(f"✍️ Claude wrote overnight alert ({len(text)} chars)")
+        return text
+
+    except Exception as e:
+        print(f"Overnight Claude writer error: {e}")
+        return None
+
+
+def run_overnight_check():
+    """
+    Overnight monitoring job — runs every 90 minutes from 1pm-6am PDT.
+    Tracks:
+    - ES futures direction and magnitude
+    - VIX change since close
+    - Institutional options flow (if available)
+    - Major news events
+    - Builds context for tomorrow's morning brief
+
+    Alert thresholds:
+    - Futures move > 0.5% → send update
+    - VIX move > 2pts → send update
+    - Major news event detected → send immediately
+    - Regular summary every 3 hours during evening
+    """
+    if not is_overnight_window():
+        return
+
+    pdt = now_pdt()
+    now_epoch = time.time()
+    h = pdt.hour
+    now_str = pdt.strftime("%H:%M")
+
+    # Cap overnight alerts — don't spam all night
+    if state.get("overnight_alerts_today", 0) >= 6:
+        return
+
+    # Regular overnight check — every 90 min
+    last_check = state.get("last_overnight_check", 0)
+    time_since_last = now_epoch - last_check
+
+    # During evening hours (6pm-11pm PDT) check more frequently
+    # This is when most major overnight events happen
+    check_interval = 5400  # 90 min default
+    if 18 <= h <= 23:
+        check_interval = 3600  # 60 min during evening
+
+    if time_since_last < check_interval:
+        return
+
+    try:
+        overnight = fetch_overnight_data()
+        if not overnight:
+            return
+
+        futures_dir = overnight.get("futures_direction", "FLAT")
+        futures_chg = overnight.get("futures_change_pct", 0) or 0
+        vix_current = overnight.get("vix_current")
+        vix_change = overnight.get("vix_change") or 0
+        vix_dir = overnight.get("vix_direction", "STABLE")
+        news_flag = overnight.get("overnight_news_flag", "NONE")
+        catalyst_type = overnight.get("catalyst_type", "NONE")
+        catalyst_str = overnight.get("catalyst_strength", 0)
+        macro_override = overnight.get("macro_override", "NO")
+        news_sentiment = overnight.get("news_sentiment", "NEUTRAL")
+
+        # Determine if alert is worth sending
+        significant_futures = abs(futures_chg) >= 0.5
+        significant_vix = abs(vix_change) >= 2.0
+        major_event = news_flag == "MAJOR_EVENT"
+        minor_event = news_flag == "MINOR" and catalyst_str >= 50
+        regular_evening_update = (18 <= h <= 20 and
+                                  not state.get("overnight_report_sent"))
+
+        should_alert = (significant_futures or significant_vix or
+                        major_event or minor_event or regular_evening_update)
+
+        if not should_alert:
+            state["last_overnight_check"] = now_epoch
+            print(f"Overnight check {now_str}: quiet (futures {futures_chg:+.1f}%, "
+                  f"VIX {vix_dir})")
+            return
+
+        # Determine alert type
+        alert_type = "major_overnight_event" if major_event else "overnight_update"
+
+        # Try Claude-written alert
+        written = write_overnight_alert_with_claude(overnight, alert_type)
+
+        # Format futures and VIX display
+        futures_emoji = "🟢" if futures_dir == "UP" else "🔴" if futures_dir == "DOWN" else "⚪"
+        vix_emoji = "😨" if vix_dir == "RISING" else "😌" if vix_dir == "FALLING" else "😐"
+        event_emoji = "🚨" if major_event else "🌙"
+
+        futures_str = (f"{futures_emoji} ES Futures: {futures_dir} "
+                       f"{futures_chg:+.2f}%")
+        if overnight.get("futures_price"):
+            futures_str += f" (${overnight['futures_price']})"
+
+        vix_str = (f"{vix_emoji} VIX: {vix_current} ({vix_dir})")
+        if vix_change and state.get("overnight_vix_close"):
+            vix_str += f" | Change: {vix_change:+.2f} since close"
+
+        catalyst_str_display = (f"📰 {catalyst_type} | {news_sentiment} | "
+                                f"Strength: {catalyst_str}/100"
+                                if catalyst_type != "NONE"
+                                else "📰 No major catalyst")
+
+        if written:
+            alert(
+                f"{event_emoji} OVERNIGHT UPDATE — SPY\n"
+                f"{'─'*35}\n"
+                f"{now_str} PDT\n\n"
+                f"{futures_str}\n"
+                f"{vix_str}\n"
+                f"{catalyst_str_display}\n\n"
+                f"{written}"
+            )
+        else:
+            # Template fallback
+            # Determine tomorrow's bias from data
+            if futures_dir == "UP" and news_sentiment != "BEARISH":
+                tomorrow_bias = "BULLISH LEAN"
+                bias_note = "Gap up open likely. Watch for hedge unwind or fade."
+            elif futures_dir == "DOWN" or (news_sentiment == "BEARISH" and catalyst_str >= 50):
+                tomorrow_bias = "BEARISH LEAN"
+                bias_note = "Gap down possible. Institutions rebuilding put protection."
+            else:
+                tomorrow_bias = "NEUTRAL"
+                bias_note = "No clear overnight edge. Wait for 6:30am GEX signal."
+
+            vix_note = ""
+            if vix_dir == "RISING":
+                vix_note = "VIX rising = fear building. Premium expensive at open."
+            elif vix_dir == "FALLING":
+                vix_note = "VIX falling = IV crush active. Vanna effects stronger."
+
+            alert(
+                f"{event_emoji} OVERNIGHT UPDATE — SPY\n"
+                f"{'─'*35}\n"
+                f"{now_str} PDT\n\n"
+                f"{futures_str}\n"
+                f"{vix_str}\n"
+                f"{catalyst_str_display}\n\n"
+                f"📊 WHAT THIS MEANS\n"
+                f"{vix_note}\n\n"
+                f"🌅 TOMORROW'S BIAS: {tomorrow_bias}\n"
+                f"{bias_note}\n\n"
+                f"⚠️ Confirm with 6:30am bot signal before trading."
+            )
+
+        state["last_overnight_check"] = now_epoch
+        state["overnight_alerts_today"] = state.get("overnight_alerts_today", 0) + 1
+        if regular_evening_update:
+            state["overnight_report_sent"] = True
+
+        print(f"🌙 Overnight alert sent at {now_str} PDT | "
+              f"Futures:{futures_chg:+.1f}% | VIX:{vix_dir} | {news_flag}")
+
+        # Log overnight reading to CSV
+        log_overnight_reading(overnight)
+
+    except Exception as e:
+        print(f"Overnight check error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def log_overnight_reading(overnight_data):
+    """
+    Logs an overnight snapshot to the CSV.
+    Marked as session_type=OVERNIGHT so ML can
+    distinguish daytime vs overnight readings.
+    """
+    try:
+        if not os.path.exists(LOG_FILE):
+            return
+
+        pdt = now_pdt()
+        today_str = pdt.strftime("%Y-%m-%d")
+        now_str = pdt.strftime("%H:%M")
+
+        futures_price = overnight_data.get("futures_price") or 0
+        futures_dir = overnight_data.get("futures_direction", "FLAT")
+        vix_current = overnight_data.get("vix_current") or 0
+        vix_change = overnight_data.get("vix_change") or 0
+        news_sentiment = overnight_data.get("news_sentiment", "NEUTRAL")
+        news_score = 50
+        catalyst_type = overnight_data.get("catalyst_type", "NONE")
+        catalyst_strength = overnight_data.get("catalyst_strength", 0)
+        macro_override = overnight_data.get("macro_override", "NO")
+        news_flag = overnight_data.get("overnight_news_flag", "NONE")
+
+        # GEX if available overnight
+        oi_gex = overnight_data.get("oi_gex") or 0
+        vol_gex = overnight_data.get("vol_gex") or 0
+        oi_b = round(oi_gex / 1e9, 4) if oi_gex else ""
+        vol_b = round(vol_gex / 1e9, 4) if vol_gex else ""
+
+        row = {
+            "date": today_str,
+            "time": now_str,
+            "price": futures_price,
+            "oi_gex_raw": oi_b,
+            "vol_gex_raw": vol_b,
+            "oi_gex_m": "", "vol_gex_m": "",
+            "ratio": "", "gex_state": "OVERNIGHT",
+            "regime": "OVERNIGHT",
+            "conviction_score": "", "grade": "",
+            "vix": vix_current, "vvix": "", "vix_term": "",
+            "tick_approx": "", "inventory_bias": "",
+            "unwind_score": "", "open_drive": "",
+            "vanna_target": "", "charm_target": "",
+            "calendar_flags": "", "days_to_opex": "",
+            "vwap_distance": "", "price_vs_open": "",
+            "session_range": "", "vol_gex_velocity": "",
+            "vol_gex_direction": "", "regime_transitions": "",
+            "vwap_breaks": "", "gamma_wall_above": "",
+            "gamma_wall_below": "", "time_of_day": "OVERNIGHT",
+            "news_sentiment": news_sentiment,
+            "news_score": news_score,
+            "catalyst_type": catalyst_type,
+            "catalyst_strength": catalyst_strength,
+            "macro_override": macro_override,
+            # Overnight-specific
+            "session_type": "OVERNIGHT",
+            "futures_direction": futures_dir,
+            "overnight_vix_move": vix_change,
+            "overnight_news_flag": news_flag,
+            # Outcomes blank
+            "outcome_direction": "", "outcome_points": "",
+            "signal_correct": "", "max_move_up": "", "max_move_down": "",
+            # AI blank for overnight
+            "claude_verdict": "", "claude_confidence": "",
+            "claude_reasoning": "", "combined_score": "",
+            "notes": ""
+        }
+
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+            writer.writerow(row)
+
+        print(f"📝 Overnight logged: {now_str} | {futures_dir} | VIX {vix_current}")
+
+    except Exception as e:
+        print(f"Overnight log error: {e}")
+
+
+# ─────────────────────────────────────────────
+# INTRADAY FEATURES
+# ─────────────────────────────────────────────
+def get_intraday_features(price, vol_gex):
+    try:
         vwap = state.get("session_vwap")
         vwap_distance = round(price - vwap, 2) if vwap else 0
 
-        # Price vs open
         open_price = state.get("open_price")
         price_vs_open = round(price - open_price, 2) if open_price else 0
 
-        # Session range
         session_high = state.get("session_high") or price
         session_low = state.get("session_low") or price
         session_high = max(session_high, price)
@@ -243,7 +832,6 @@ def get_intraday_features(price, vol_gex):
         state["session_low"] = session_low
         session_range = round(session_high - session_low, 2)
 
-        # Vol GEX velocity
         history = state.get("vol_gex_history", [])
         if len(history) >= 2:
             velocity = round(vol_gex - history[-2], 4)
@@ -255,24 +843,8 @@ def get_intraday_features(price, vol_gex):
             velocity = 0
             vol_gex_direction = "STABLE"
 
-        # Regime transitions today
-        regime_transitions = state.get("regime_transitions_today", 0)
-
-        # VWAP breaks today
-        vwap_breaks = state.get("vwap_breaks_today", 0)
-
-        # Gamma walls (simple approximation from OI concentration)
-        gamma_wall_above = state.get("gamma_wall_above", "")
-        gamma_wall_below = state.get("gamma_wall_below", "")
-
-        # Time of day (PDT)
         h = now_pdt().hour
-        if h < 8:
-            time_of_day = "EARLY"
-        elif h < 11:
-            time_of_day = "MID"
-        else:
-            time_of_day = "LATE"
+        time_of_day = "EARLY" if h < 8 else "MID" if h < 11 else "LATE"
 
         return {
             "vwap_distance": vwap_distance,
@@ -280,10 +852,10 @@ def get_intraday_features(price, vol_gex):
             "session_range": session_range,
             "vol_gex_velocity": velocity,
             "vol_gex_direction": vol_gex_direction,
-            "regime_transitions": regime_transitions,
-            "vwap_breaks": vwap_breaks,
-            "gamma_wall_above": gamma_wall_above,
-            "gamma_wall_below": gamma_wall_below,
+            "regime_transitions": state.get("regime_transitions_today", 0),
+            "vwap_breaks": state.get("vwap_breaks_today", 0),
+            "gamma_wall_above": state.get("gamma_wall_above", ""),
+            "gamma_wall_below": state.get("gamma_wall_below", ""),
             "time_of_day": time_of_day,
         }
     except Exception as e:
@@ -296,336 +868,14 @@ def get_intraday_features(price, vol_gex):
 
 
 # ─────────────────────────────────────────────
-# AI VERIFICATION LAYER
-# Sends signal data to Claude API for
-# independent review before firing alert
-# Logs verdict to CSV for ML training
+# LOG READING — daytime
 # ─────────────────────────────────────────────
-def verify_signal_with_claude(signal_type, price, gex_state, regime,
-                                vol_gex, oi_gex, ratio, vix, vvix,
-                                news_sentiment, catalyst_type,
-                                macro_override, conviction_score,
-                                unwind_score, vanna_target, charm_target):
-    """
-    Sends current market snapshot to Claude for verification.
-    Returns: verdict, confidence, reasoning, combined_score
-
-    Verdict options:
-    CONFIRM  — Claude agrees with bot signal
-    CHALLENGE — Claude disagrees or sees risk
-    NEUTRAL  — Insufficient data to verify
-    """
-    if not anthropic_client:
-        return "UNAVAILABLE", 0, "No API key configured", conviction_score
-
-    try:
-        vol_b = round(vol_gex / 1e9, 2)
-        oi_b = round(oi_gex / 1e9, 2)
-
-        prompt = f"""You are an expert options flow analyst reviewing a SPY 0DTE trading signal.
-Analyze this market data and verify whether the bot signal is sound.
-
-CURRENT MARKET DATA:
-- SPY Price: ${price}
-- GEX State: {gex_state}
-- Regime: {regime}
-- Vol GEX: {vol_b}B (raw)
-- OI GEX: {oi_b}B (raw)
-- Vol/OI Ratio: {ratio:.2f}x
-- VIX: {vix}
-- VVIX: {vvix}
-- News Sentiment: {news_sentiment}
-- Catalyst Type: {catalyst_type}
-- Macro Override: {macro_override}
-- Unwind Score: {unwind_score}/100
-- Vanna Target: ${vanna_target or 'None'}
-- Charm Target: ${charm_target or 'None'}
-- Bot Conviction: {conviction_score}/100
-
-SIGNAL BEING EVALUATED: {signal_type}
-
-Rules for your analysis:
-1. If macro_override is YES and catalyst is GEO or FED, reduce confidence in structure signals
-2. If Vol GEX and OI GEX are same sign with ratio > 1.5x, signal is directionally confirmed
-3. If VVIX > 100, velocity conditions support premium expansion
-4. If unwind_score > 40, mechanical bullish pressure exists regardless of structure
-5. Contradictions between news and GEX signal = higher risk
-
-Respond in this exact JSON format, nothing else:
-{{
-  "verdict": "CONFIRM" or "CHALLENGE" or "NEUTRAL",
-  "confidence": <integer 0-100>,
-  "reasoning": "<2-3 sentences max explaining your verdict>",
-  "risk_factor": "<single biggest risk to this signal>"
-}}"""
-
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        import json
-        raw = response.content[0].text.strip()
-        # Clean any markdown fences if present
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw)
-
-        verdict = result.get("verdict", "NEUTRAL")
-        confidence = int(result.get("confidence", 50))
-        reasoning = result.get("reasoning", "")
-        risk_factor = result.get("risk_factor", "")
-
-        # Calculate combined score
-        if verdict == "CONFIRM":
-            combined = min(100, int(
-                (conviction_score * 0.6) +
-                (confidence * 0.4) * 1.15
-            ))
-        elif verdict == "CHALLENGE":
-            combined = max(0, int(
-                (conviction_score * 0.4) +
-                ((100 - confidence) * 0.2) * 0.7
-            ))
-        else:
-            combined = conviction_score
-
-        full_reasoning = f"{reasoning} Risk: {risk_factor}"
-
-        print(f"🤖 Claude verdict: {verdict} ({confidence}%) | Combined: {combined}")
-        return verdict, confidence, full_reasoning, combined
-
-    except Exception as e:
-        print(f"Claude verification error: {e}")
-        return "UNAVAILABLE", 0, str(e)[:100], conviction_score
-    """
-    Auto-commits the CSV to GitHub after every EOD write.
-    Requires GITHUB_TOKEN in Railway environment variables.
-    Data survives Railway redeploys permanently.
-
-    Setup in Railway:
-    Variable name: GITHUB_TOKEN
-    Value: your GitHub personal access token
-    Get one at: github.com/settings/tokens
-    Needs repo scope only
-    """
-    try:
-        import subprocess
-
-        github_token = os.getenv("GITHUB_TOKEN", "")
-        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
-
-        if not github_token:
-            print("⚠️ GITHUB_TOKEN not set — CSV not committed to GitHub")
-            print("   Add GITHUB_TOKEN to Railway environment variables")
-            print("   Get token at: github.com/settings/tokens")
-            return
-
-        today_str = date.today().strftime("%Y-%m-%d")
-
-        # Configure git with token authentication
-        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", remote_url],
-            check=True, capture_output=True
-        )
-
-        # Configure git identity for the commit
-        subprocess.run(
-            ["git", "config", "user.email", "gammabot@railway.app"],
-            check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "GammaBot"],
-            check=True, capture_output=True
-        )
-
-        # Add and commit the CSV
-        subprocess.run(
-            ["git", "add", LOG_FILE],
-            check=True, capture_output=True
-        )
-
-        # Check if there's anything to commit
-        result = subprocess.run(
-            ["git", "diff", "--staged", "--quiet"],
-            capture_output=True
-        )
-        if result.returncode == 0:
-            print("📝 No new CSV data to commit today")
-            return
-
-        subprocess.run([
-            "git", "commit", "-m",
-            f"Auto-log: SPY GEX data {today_str}"
-        ], check=True, capture_output=True)
-
-        subprocess.run(
-            ["git", "push", "origin", "main"],
-            check=True, capture_output=True
-        )
-
-        print(f"✅ CSV committed to GitHub: {today_str}")
-
-    except subprocess.CalledProcessError as e:
-        print(f"Git commit error: {e}")
-        print("CSV data saved locally on Railway")
-        print("Check GITHUB_TOKEN has repo write access")
-    except Exception as e:
-        print(f"Git commit error (non-critical): {e}")
-
-
-# ─────────────────────────────────────────────
-# CLAUDE ALERT WRITER
-# Claude writes the full alert text from scratch
-# No templates — every alert unique to the moment
-# Used for: morning report, regime transition,
-#           hedge unwind, EOD summary
-# ─────────────────────────────────────────────
-def write_alert_with_claude(alert_type, price, gex_state, regime,
-                             vol_gex, oi_gex, ratio, vix, vvix,
-                             conviction, combined, unwind_score,
-                             vanna_target, charm_target, news_sentiment,
-                             catalyst_type, macro_override, flow_dir,
-                             previous_regime, previous_gex_state,
-                             claude_verdict, extra_context=""):
-    """
-    Claude writes the full alert text from scratch.
-    No templates. Every alert is unique to that moment.
-    Falls back to None if API unavailable — caller
-    uses template as fallback.
-    """
-    if not anthropic_client:
-        return None
-
-    try:
-        vol_b = round(vol_gex / 1e9, 2)
-        oi_b = round(oi_gex / 1e9, 2)
-        now_str = now_pdt().strftime("%H:%M")
-
-        prompts = {
-            "morning_report": f"""You are writing a pre-market briefing for a SPY 0DTE options trader in California.
-Time: {now_str} PDT | SPY: ${price}
-
-Market data:
-- Regime: {regime} (was {previous_regime})
-- GEX State: {gex_state}
-- Vol GEX: {vol_b}B | OI GEX: {oi_b}B | Ratio: {ratio:.2f}x
-- VIX: {vix} | VVIX: {vvix}
-- Conviction: {conviction}/100 | AI Combined: {combined}/100
-- News: {news_sentiment} | Catalyst: {catalyst_type} | Override: {macro_override}
-- Unwind Score: {unwind_score}/100
-- Vanna target: ${vanna_target or 'none'} | Charm: ${charm_target or 'none'}
-{extra_context}
-
-Write a morning briefing. Rules:
-- Max 10 lines total
-- Plain English — no jargon
-- Tell them what to expect today and why
-- Give one clear actionable recommendation
-- Name the biggest risk for today
-- End with: what size to trade and when to enter
-- Write like an experienced trader talking to a friend
-- No bullet points, no section headers
-- Use 1-2 emojis max, naturally placed""",
-
-            "regime_transition": f"""You are writing a trading alert for a SPY 0DTE options trader.
-Time: {now_str} PDT | SPY: ${price}
-
-What just changed:
-- Regime: {previous_regime} → {regime}
-- GEX: {gex_state} | Vol: {vol_b}B | OI: {oi_b}B
-- Ratio: {ratio:.2f}x | VIX: {vix} | VVIX: {vvix}
-- Conviction: {conviction}/100 | AI Combined: {combined}/100
-- News: {news_sentiment} | Catalyst: {catalyst_type}
-- Macro Override: {macro_override}
-- Vanna target: ${vanna_target or 'none'}
-- AI verdict: {claude_verdict}
-{extra_context}
-
-Write a regime transition alert. Rules:
-- Max 8 lines total
-- Line 1: what just changed and why it matters right now
-- Line 2-3: what this means mechanically in plain English
-- Line 4-5: exactly what to do — calls or puts, entry, target, stop
-- Line 6: the one thing that kills this trade
-- No bullet points, no headers
-- 1-2 emojis max""",
-
-            "hedge_unwind": f"""You are writing a hedge unwind alert for a SPY 0DTE options trader.
-Time: {now_str} PDT | SPY: ${price}
-
-Signal:
-- Unwind score: {unwind_score}/100
-- Regime: {regime} | Flow: {flow_dir}
-- Vol GEX: {vol_b}B
-- Vanna target: ${vanna_target or 'none'}
-- VIX: {vix} | VVIX: {vvix}
-- Conviction: {conviction}/100 | AI Combined: {combined}/100
-- News: {news_sentiment} | Catalyst: {catalyst_type}
-- AI verdict: {claude_verdict}
-{extra_context}
-
-Write a hedge unwind alert. Rules:
-- Max 7 lines total
-- Explain in plain English why price is rising
-  (institutions closing puts forces MMs to buy shares)
-- Give the specific call target price
-- Give the exit zone — where to sell
-- Name the one thing that kills this trade
-- No jargon
-- 1-2 emojis max""",
-
-            "eod_summary": f"""You are writing an end of day summary for a SPY 0DTE options trader.
-{extra_context}
-
-Write a brief EOD summary. Rules:
-- Max 8 lines total
-- What happened today in plain English
-- Was the morning signal right or wrong and why
-- What to watch for tomorrow morning
-- Any overnight risks
-- Honest — if signal was wrong say so clearly
-- 1-2 emojis max
-- Last line: one sentence on tomorrow's bias"""
-        }
-
-        prompt = prompts.get(alert_type, prompts["regime_transition"])
-
-        response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        text = response.content[0].text.strip()
-        print(f"✍️ Claude wrote {alert_type} ({len(text)} chars)")
-        return text
-
-    except Exception as e:
-        print(f"Claude alert writer error: {e}")
-        return None
-
-
-def init_log():
-    """Create CSV file with headers if it doesn't exist."""
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
-            writer.writeheader()
-        print(f"Log file created: {LOG_FILE}")
-
 def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
                 regime, conv, grade, vix_spot, vvix_val, vix_term,
                 tick_approx, inventory_bias, unwind_score, open_drive,
                 vanna_target, charm_target, cal_flags, days_opex,
                 claude_verdict="", claude_confidence=0,
                 claude_reasoning="", combined_score=0):
-    """
-    Fully automated logging — no manual input required.
-    Fetches news sentiment, calculates intraday features,
-    and writes complete ML-ready row to CSV.
-    """
     try:
         now = now_pdt()
         cal_summary = (
@@ -634,16 +884,17 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             f"OPEX_IN_{days_opex}D" if days_opex else "NORMAL"
         )
 
-        # Fetch all automated features
         intraday = get_intraday_features(price, vol_gex)
-        news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = fetch_news_sentiment()
+        news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = \
+            fetch_news_sentiment()
 
-        # Store for AI verification
         state["last_news_sentiment"] = news_sentiment
         state["last_catalyst_type"] = catalyst_type
         state["last_macro_override"] = macro_override
 
-        clean_grade = grade.replace("🔥","").replace("✅","").replace("⚠️","").replace("🔴","").replace("❌","").strip()
+        clean_grade = (grade.replace("🔥", "").replace("✅", "")
+                       .replace("⚠️", "").replace("🔴", "")
+                       .replace("❌", "").strip())
 
         row = {
             "date": now.strftime("%Y-%m-%d"),
@@ -669,7 +920,6 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "charm_target": charm_target or "",
             "calendar_flags": cal_summary,
             "days_to_opex": days_opex or "",
-            # Intraday features — all auto
             "vwap_distance": intraday["vwap_distance"],
             "price_vs_open": intraday["price_vs_open"],
             "session_range": intraday["session_range"],
@@ -680,24 +930,24 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "gamma_wall_above": intraday["gamma_wall_above"],
             "gamma_wall_below": intraday["gamma_wall_below"],
             "time_of_day": intraday["time_of_day"],
-            # Catalyst features — all auto
             "news_sentiment": news_sentiment,
             "news_score": news_score,
             "catalyst_type": catalyst_type,
             "catalyst_strength": catalyst_strength,
             "macro_override": macro_override,
-            # Outcomes — filled by EOD autofill
+            "session_type": "MARKET",
+            "futures_direction": "",
+            "overnight_vix_move": "",
+            "overnight_news_flag": "",
             "outcome_direction": "",
             "outcome_points": "",
             "signal_correct": "",
             "max_move_up": "",
             "max_move_down": "",
-            # AI verification
             "claude_verdict": claude_verdict,
             "claude_confidence": claude_confidence,
             "claude_reasoning": claude_reasoning[:500] if claude_reasoning else "",
             "combined_score": combined_score,
-            # Only optional field for you
             "notes": ""
         }
 
@@ -706,83 +956,194 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             writer.writerow(row)
 
         print(f"📝 Logged: {row['time']} | {gex_state} | Score:{conv} | "
-              f"News:{news_sentiment} | Catalyst:{catalyst_type} | "
-              f"MacroOverride:{macro_override}")
+              f"News:{news_sentiment} | Catalyst:{catalyst_type}")
 
     except Exception as e:
         print(f"log_reading error: {e}")
 
-UW_TOKEN = os.getenv("UW_TOKEN")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-TICKER = "SPY"
-
-# Anthropic client — used for AI signal verification
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 # ─────────────────────────────────────────────
-# GLOBAL STATE — unified from both bots
+# AI VERIFICATION LAYER
 # ─────────────────────────────────────────────
-state = {
-    # Original gamma bot state
-    "previous_gex_state": None,
-    "previous_ratio": None,
-    "vwap_alert_sent": False,
+def verify_signal_with_claude(signal_type, price, gex_state, regime,
+                               vol_gex, oi_gex, ratio, vix, vvix,
+                               news_sentiment, catalyst_type,
+                               macro_override, conviction_score,
+                               unwind_score, vanna_target, charm_target):
+    if not anthropic_client:
+        return "UNAVAILABLE", 0, "No API key configured", conviction_score
 
-    # Intelligence bot state
-    "previous_vol_gex": None,
-    "previous_oi_gex": None,
-    "vol_gex_history": [],
-    "regime": None,
-    "previous_regime": None,
-    "velocity_score_sent": False,
-    "consolidation_alert_sent": False,
-    "hedge_unwind_alert_sent": False,
-    "open_price": None,
-    "open_iv": None,
-    "open_volume": None,
-    "open_time_prices": [],
-    "last_conviction_score": None,
+    try:
+        vol_b = round(vol_gex / 1e9, 2)
+        oi_b = round(oi_gex / 1e9, 2)
 
-    # New precision tracking from image data
-    "tick_history": [],           # rolling TICK readings
-    "vix_history": [],            # rolling VIX for momentum
-    "inventory_bias": "NEUTRAL",  # Bull/Bear/Neutral zone
-    "open_drive_detected": False, # open drive confirmation
-    "session_high": None,
-    "session_low": None,
+        prompt = f"""You are an expert options flow analyst reviewing a SPY 0DTE trading signal.
+Analyze this market data and verify whether the bot signal is sound.
 
-    # Alert timing fixes
-    "last_unwind_alert_time": 0,
-    "last_summary_time": 0,
-    "consolidation_gex_state": None,
+CURRENT MARKET DATA:
+- SPY Price: ${price}
+- GEX State: {gex_state}
+- Regime: {regime}
+- Vol GEX: {vol_b}B | OI GEX: {oi_b}B | Ratio: {ratio:.2f}x
+- VIX: {vix} | VVIX: {vvix}
+- News: {news_sentiment} | Catalyst: {catalyst_type} | Override: {macro_override}
+- Unwind Score: {unwind_score}/100
+- Vanna Target: ${vanna_target or 'None'} | Charm: ${charm_target or 'None'}
+- Bot Conviction: {conviction_score}/100
 
-    # New module state
-    "last_heartbeat": 0,
-    "doji_transition_sent": False,
-    "last_wall_alert_price": 0,
-    "current_vanna_target": None,
-    "current_charm_target": None,
-    "regime_transitions_today": 0,
-    "vwap_breaks_today": 0,
-    "session_vwap": None,
-    "eod_fired_today": False,
-    "regime": None,
-}
+SIGNAL: {signal_type}
 
-# OPEX dates 2026 — update quarterly
-OPEX_DATES = [
-    date(2026, 1, 16), date(2026, 2, 20), date(2026, 3, 21),
-    date(2026, 4, 17), date(2026, 5, 15), date(2026, 6, 20),
-    date(2026, 7, 17), date(2026, 8, 21), date(2026, 9, 18),
-    date(2026, 10, 16), date(2026, 11, 20), date(2026, 12, 18),
-]
+Rules:
+1. If macro_override YES + catalyst GEO/FED → reduce structure signal confidence
+2. Vol GEX + OI GEX same sign with ratio > 1.5x → directionally confirmed
+3. VVIX > 100 → velocity conditions support premium expansion
+4. Unwind score > 40 → mechanical bullish pressure regardless of structure
+5. Contradictions between news and GEX → higher risk
 
-QUARTER_END_DATES = [
-    date(2026, 3, 31), date(2026, 6, 30),
-    date(2026, 9, 30), date(2026, 12, 31),
-]
+Respond in this exact JSON format only:
+{{
+  "verdict": "CONFIRM" or "CHALLENGE" or "NEUTRAL",
+  "confidence": <integer 0-100>,
+  "reasoning": "<2-3 sentences max>",
+  "risk_factor": "<single biggest risk>"
+}}"""
+
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        import json
+        raw = response.content[0].text.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+
+        verdict = result.get("verdict", "NEUTRAL")
+        confidence = int(result.get("confidence", 50))
+        reasoning = result.get("reasoning", "")
+        risk_factor = result.get("risk_factor", "")
+
+        if verdict == "CONFIRM":
+            combined = min(100, int((conviction_score * 0.6) + (confidence * 0.4) * 1.15))
+        elif verdict == "CHALLENGE":
+            combined = max(0, int((conviction_score * 0.4) + ((100 - confidence) * 0.2) * 0.7))
+        else:
+            combined = conviction_score
+
+        full_reasoning = f"{reasoning} Risk: {risk_factor}"
+        print(f"🤖 Claude: {verdict} ({confidence}%) | Combined: {combined}")
+        return verdict, confidence, full_reasoning, combined
+
+    except Exception as e:
+        print(f"Claude verification error: {e}")
+        return "UNAVAILABLE", 0, str(e)[:100], conviction_score
+
+
+# ─────────────────────────────────────────────
+# CLAUDE ALERT WRITER
+# ─────────────────────────────────────────────
+def write_alert_with_claude(alert_type, price, gex_state, regime,
+                             vol_gex, oi_gex, ratio, vix, vvix,
+                             conviction, combined, unwind_score,
+                             vanna_target, charm_target, news_sentiment,
+                             catalyst_type, macro_override, flow_dir,
+                             previous_regime, previous_gex_state,
+                             claude_verdict, extra_context=""):
+    if not anthropic_client:
+        return None
+
+    try:
+        vol_b = round(vol_gex / 1e9, 2)
+        oi_b = round(oi_gex / 1e9, 2)
+        now_str = now_pdt().strftime("%H:%M")
+
+        prompts = {
+            "morning_report": f"""You are writing a pre-market briefing for a SPY 0DTE options trader in California.
+Time: {now_str} PDT | SPY: ${price}
+
+Market data:
+- Regime: {regime} (was {previous_regime})
+- GEX State: {gex_state} | Vol: {vol_b}B | OI: {oi_b}B | Ratio: {ratio:.2f}x
+- VIX: {vix} | VVIX: {vvix} | Conviction: {conviction}/100 | AI: {combined}/100
+- News: {news_sentiment} | Catalyst: {catalyst_type} | Override: {macro_override}
+- Unwind: {unwind_score}/100 | Vanna: ${vanna_target or 'none'} | Charm: ${charm_target or 'none'}
+{extra_context}
+
+Write a morning briefing. Rules:
+- Max 10 lines total, plain English
+- What to expect today and why
+- One clear actionable recommendation
+- Name the biggest risk
+- End with: size and when to enter
+- Write like an experienced trader to a friend
+- No bullet points, no headers, 1-2 emojis max""",
+
+            "regime_transition": f"""You are writing a trading alert for a SPY 0DTE options trader.
+Time: {now_str} PDT | SPY: ${price}
+
+What changed: {previous_regime} → {regime}
+GEX: {gex_state} | Vol: {vol_b}B | OI: {oi_b}B | Ratio: {ratio:.2f}x
+VIX: {vix} | VVIX: {vvix} | Conviction: {conviction}/100 | AI: {combined}/100
+News: {news_sentiment} | Catalyst: {catalyst_type} | Override: {macro_override}
+Vanna: ${vanna_target or 'none'} | AI verdict: {claude_verdict}
+{extra_context}
+
+Write a regime transition alert. Rules:
+- Max 8 lines, no bullet points, no headers
+- Line 1: what changed and why it matters now
+- Lines 2-3: mechanical explanation in plain English
+- Lines 4-5: exactly what to do — calls/puts, entry, target, stop
+- Line 6: the one thing that kills this trade
+- 1-2 emojis max""",
+
+            "hedge_unwind": f"""You are writing a hedge unwind alert for a SPY 0DTE options trader.
+Time: {now_str} PDT | SPY: ${price}
+
+Unwind score: {unwind_score}/100 | Regime: {regime}
+Vol GEX: {vol_b}B | Vanna target: ${vanna_target or 'none'}
+VIX: {vix} | VVIX: {vvix} | Conviction: {conviction}/100 | AI: {combined}/100
+News: {news_sentiment} | Catalyst: {catalyst_type} | AI verdict: {claude_verdict}
+{extra_context}
+
+Write a hedge unwind alert. Rules:
+- Max 7 lines
+- Explain why price is rising in plain English
+  (institutions closing puts forces MMs to buy shares)
+- Specific call target price
+- Exit zone — where to sell
+- One thing that kills this trade
+- No jargon, 1-2 emojis max""",
+
+            "eod_summary": f"""You are writing an end of day summary for a SPY 0DTE options trader.
+{extra_context}
+
+Write a brief EOD summary. Rules:
+- Max 8 lines
+- What happened today in plain English
+- Was the morning signal right or wrong and why
+- What to watch for tomorrow morning
+- Any overnight risks
+- Honest — if signal was wrong, say so
+- 1-2 emojis max
+- Last line: tomorrow's one-sentence bias"""
+        }
+
+        prompt = prompts.get(alert_type, prompts["regime_transition"])
+
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        text = response.content[0].text.strip()
+        print(f"✍️ Claude wrote {alert_type} ({len(text)} chars)")
+        return text
+
+    except Exception as e:
+        print(f"Claude alert writer error: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -797,9 +1158,7 @@ def get_calendar_flags():
         flags.append(
             "🗓️ QUARTER END TODAY\n"
             "   → Window dressing = bullish bias\n"
-            "   → Hedge unwind probability: VERY HIGH\n"
-            "   → Funds closing puts to clean Q books\n"
-            "   → Expect put selling into close"
+            "   → Hedge unwind probability: VERY HIGH"
         )
         score_bonus += 15
     else:
@@ -808,8 +1167,7 @@ def get_calendar_flags():
             if 0 < delta <= 2:
                 flags.append(
                     f"🗓️ QUARTER END IN {delta} DAYS\n"
-                    f"   → Early hedge unwind likely starting\n"
-                    f"   → Bullish bias building"
+                    f"   → Early hedge unwind likely"
                 )
                 score_bonus += 10
                 break
@@ -823,27 +1181,13 @@ def get_calendar_flags():
 
     if days_to_opex is not None:
         if days_to_opex == 0:
-            flags.append(
-                "⚡ OPEX DAY\n"
-                "   → Maximum gamma decay\n"
-                "   → Expect pinning at major strike OR explosive move\n"
-                "   → Best 0DTE setups happen here"
-            )
+            flags.append("⚡ OPEX DAY — Maximum gamma decay")
             score_bonus += 20
         elif days_to_opex <= 2:
-            flags.append(
-                f"⚡ OPEX IN {days_to_opex} DAYS\n"
-                f"   → Gamma acceleration zone\n"
-                f"   → Best window for 400-700% setups\n"
-                f"   → Negative GEX amplifying moves"
-            )
+            flags.append(f"⚡ OPEX IN {days_to_opex} DAYS — Gamma acceleration zone")
             score_bonus += 15
         elif days_to_opex <= 5:
-            flags.append(
-                f"📅 OPEX IN {days_to_opex} DAYS\n"
-                f"   → Elevated gamma activity beginning\n"
-                f"   → Watch for GEX build"
-            )
+            flags.append(f"📅 OPEX IN {days_to_opex} DAYS — Elevated gamma activity")
             score_bonus += 8
         else:
             flags.append(f"📅 OPEX IN {days_to_opex} DAYS — Standard conditions")
@@ -852,7 +1196,7 @@ def get_calendar_flags():
 
 
 # ─────────────────────────────────────────────
-# MODULE 2: GEX FETCH (original gamma bot)
+# MODULE 2: GEX FETCH
 # ─────────────────────────────────────────────
 def fetch_gex():
     try:
@@ -881,7 +1225,6 @@ def detect_regime(oi_gex, vol_gex, vol_gex_history):
 
     recent = vol_gex_history[-3:]
     roc = recent[-1] - recent[0]
-    mid_roc = recent[-1] - recent[-2]
 
     vol_positive = vol_gex > 0
     oi_positive = oi_gex > 0
@@ -891,6 +1234,7 @@ def detect_regime(oi_gex, vol_gex, vol_gex_history):
     if vol_positive and not oi_positive:
         return "HEDGE_UNWIND_CONFIRMED", 88
     if not vol_positive:
+        mid_roc = recent[-1] - recent[-2]
         if roc > 0 and mid_roc > 0:
             return "HEDGE_UNWIND_EARLY", 72
         elif roc > 0 and mid_roc <= 0:
@@ -907,48 +1251,32 @@ def get_regime_signal(regime, confidence, oi_b, vol_b):
         "BULLISH_MOMENTUM": (
             "🟢 BULLISH MOMENTUM\n"
             "Both OI and Vol GEX positive.\n"
-            "MMs long gamma — selling into strength.\n"
-            "Moves dampened. Good for steady gains.\n"
             "→ Calls OK but don't expect 400%+ today."
         ),
         "HEDGE_UNWIND_CONFIRMED": (
             "🚀 HEDGE UNWIND CONFIRMED\n"
             "Vol GEX flipped positive — OI still negative.\n"
-            "Institutions CLOSING put hedges.\n"
-            "MMs buying shares as delta collateral = price rises.\n"
-            "No new call buying needed — put SELLING is the fuel.\n"
+            "Put SELLING is the fuel. Price rises mechanically.\n"
             "→ CALLS strongly favored. 400-700% setup."
         ),
         "HEDGE_UNWIND_EARLY": (
             "🔄 EARLY HEDGE UNWIND ← CAUGHT EARLY\n"
             "Vol GEX still negative but improving rapidly.\n"
-            "Institutions BEGINNING to close hedges.\n"
-            "Signal BEFORE the rocket fires.\n"
             "→ Prepare call entry. Watch for Vol GEX flip."
         ),
         "TRANSITION_ZONE": (
             "⚠️ TRANSITION ZONE\n"
             "Vol GEX decelerating but not reversing yet.\n"
-            "Genuine decision point — could go either way.\n"
             "→ No new entries. Wait for confirmation."
         ),
         "BEARISH_HEDGE_BUILD": (
             "🔴 BEARISH HEDGE BUILD\n"
             "Vol GEX accelerating negative.\n"
-            "Institutions BUYING put protection.\n"
-            "MMs selling shares to hedge = downward pressure.\n"
+            "Institutions buying put protection.\n"
             "→ PUTS favored. Calls at serious risk."
         ),
-        "NEUTRAL": (
-            "⚪ NEUTRAL\n"
-            "No clear directional bias.\n"
-            "→ Stay out. Wait for regime to establish."
-        ),
-        "INSUFFICIENT_DATA": (
-            "📊 COLLECTING DATA\n"
-            "Need 3+ readings to establish regime.\n"
-            "→ Check back in 30-45 minutes."
-        ),
+        "NEUTRAL": "⚪ NEUTRAL\n→ Stay out. Wait for regime to establish.",
+        "INSUFFICIENT_DATA": "📊 COLLECTING DATA\n→ Check back in 30-45 minutes.",
     }
     base = explanations.get(regime, "Unknown regime")
     return f"{base}\nConfidence: {confidence}% | OI: {oi_b}B | Vol: {vol_b}B"
@@ -988,27 +1316,24 @@ def fetch_hedge_unwind_signals():
                 if is_put and vol_oi_ratio >= 50 and volume >= 10000:
                     unwind_score += 25
                     unwind_signals.append(
-                        f"🚀 PUT HEDGE CLOSING: ${strike:.0f}P\n"
-                        f"   Vol/OI: {round(vol_oi_ratio)}x ({int(volume/1000)}K vol)\n"
-                        f"   → Institutions unwinding protection"
+                        f"🚀 PUT HEDGE CLOSING: ${strike:.0f}P "
+                        f"Vol/OI: {round(vol_oi_ratio)}x"
                     )
                 elif is_put and vol_oi_ratio >= 10 and volume >= 5000:
                     unwind_score += 10
                     unwind_signals.append(
-                        f"⚠️ PUT CLOSING (moderate): ${strike:.0f}P "
+                        f"⚠️ PUT CLOSING: ${strike:.0f}P "
                         f"Vol/OI: {round(vol_oi_ratio)}x"
                     )
                 if is_put and is_descending and volume >= 5000:
                     unwind_score += 15
                     unwind_signals.append(
-                        f"🔽 DESCENDING FILL PUT: ${strike:.0f}P\n"
-                        f"   → Aggressive institutional put selling"
+                        f"🔽 DESCENDING FILL PUT: ${strike:.0f}P"
                     )
                 if is_call and is_sweep and volume >= 5000:
                     unwind_score += 8
                     unwind_signals.append(
-                        f"📈 CALL SWEEP: ${strike:.0f}C\n"
-                        f"   → Fresh bullish entry, {int(volume/1000)}K contracts"
+                        f"📈 CALL SWEEP: ${strike:.0f}C {int(volume/1000)}K contracts"
                     )
             except Exception:
                 continue
@@ -1019,7 +1344,7 @@ def fetch_hedge_unwind_signals():
             return True, unwind_score, unwind_signals[:6], "BULLISH — Hedge unwind active"
         elif unwind_score >= 20:
             return True, unwind_score, unwind_signals[:6], "LEANING BULLISH — Early unwind signs"
-        return False, unwind_score, unwind_signals[:6], "NEUTRAL — No unwind detected"
+        return False, unwind_score, unwind_signals[:6], "NEUTRAL"
 
     except Exception as e:
         print(f"Hedge unwind error: {e}")
@@ -1035,10 +1360,11 @@ def fetch_vanna_charm():
         headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
 
         params = {"greek": "vanna", "expiry": "0dte"}
-        v_data = requests.get(url, headers=headers, params=params, timeout=10).json().get("data", [])
-
+        v_data = requests.get(url, headers=headers, params=params,
+                               timeout=10).json().get("data", [])
         params["greek"] = "charm"
-        c_data = requests.get(url, headers=headers, params=params, timeout=10).json().get("data", [])
+        c_data = requests.get(url, headers=headers, params=params,
+                               timeout=10).json().get("data", [])
 
         vanna_target = vanna_strength = charm_target = charm_strength = None
 
@@ -1052,10 +1378,8 @@ def fetch_vanna_charm():
             charm_target = float(worst.get("strike", 0))
             charm_strength = float(worst.get("charm", 0) or 0)
 
-        conflict = (
-            vanna_target and charm_target and
-            abs(vanna_target - charm_target) <= 1.0
-        )
+        conflict = (vanna_target and charm_target and
+                    abs(vanna_target - charm_target) <= 1.0)
 
         return vanna_target, vanna_strength, charm_target, charm_strength, conflict
 
@@ -1089,13 +1413,10 @@ def get_vanna_charm_read(vanna_target, vanna_strength, charm_target,
         )
 
     if conflict:
-        lines.append(
-            "⚠️ CONFLICT: Vanna + Charm stacked at same strike\n"
-            "   Forces canceling = CONSOLIDATION TRAP risk"
-        )
+        lines.append("⚠️ CONFLICT: Vanna + Charm stacked — CONSOLIDATION TRAP risk")
 
     if vanna_window_open:
-        lines.append(f"⏰ Vanna window: ~{mins_left} min left before charm dominates")
+        lines.append(f"⏰ Vanna window: ~{mins_left} min left")
     else:
         lines.append("🕐 Charm now dominant — vanna tailwind expired")
 
@@ -1121,18 +1442,14 @@ def run_consolidation_check(current_price, current_iv, current_volume,
         if prox <= 0.5:
             score += 30
             signals.append(
-                f"⚠️ Price within 0.5% of vanna ${vanna_target} "
-                f"({prox:.2f}% away) — magnetic stall zone"
+                f"⚠️ Price within 0.5% of vanna ${vanna_target} — magnetic stall"
             )
 
     if state["open_iv"] and current_iv:
         iv_chg = abs(current_iv - state["open_iv"]) / state["open_iv"] * 100
         if iv_chg < 2.0:
             score += 25
-            signals.append(
-                f"⚠️ IV only {iv_chg:.1f}% from open — "
-                f"no directional conviction. Need >2% for real move."
-            )
+            signals.append(f"⚠️ IV only {iv_chg:.1f}% from open — no conviction")
         else:
             signals.append(f"✅ IV moving {iv_chg:.1f}% — conviction present")
 
@@ -1140,17 +1457,11 @@ def run_consolidation_check(current_price, current_iv, current_volume,
         vol_ratio = current_volume / state["open_volume"]
         if vol_ratio < 0.7:
             score += 20
-            signals.append(
-                f"⚠️ Volume only {round(vol_ratio*100)}% of open — "
-                f"institutions not participating"
-            )
+            signals.append(f"⚠️ Volume only {round(vol_ratio*100)}% of open")
 
     if conflict:
         score += 15
-        signals.append(
-            "⚠️ Vanna + charm stacked at same strike — "
-            "directional forces canceling out"
-        )
+        signals.append("⚠️ Vanna + charm stacked at same strike")
 
     if len(state["open_time_prices"]) >= 4:
         prices = state["open_time_prices"]
@@ -1161,10 +1472,7 @@ def run_consolidation_check(current_price, current_iv, current_volume,
         rng = max(prices) - min(prices)
         if changes >= 3 and rng < 1.5:
             score += 10
-            signals.append(
-                f"⚠️ {changes} direction changes, ${rng:.2f} range — "
-                f"choppy, no follow-through"
-            )
+            signals.append(f"⚠️ {changes} direction changes, ${rng:.2f} range — choppy")
 
     return score >= 50, score, signals
 
@@ -1182,17 +1490,15 @@ def fetch_vix_data():
         vvix_val = float(vvix_hist["Close"].iloc[-1]) if not vvix_hist.empty else None
         vix3m_val = float(vix3m_hist["Close"].iloc[-1]) if not vix3m_hist.empty else None
 
-        # Track VIX history for momentum
         if vix_spot:
             state["vix_history"].append(vix_spot)
             if len(state["vix_history"]) > 5:
                 state["vix_history"].pop(0)
 
-        # Term structure
         if vix_spot and vix3m_val:
             if vix_spot > vix3m_val * 1.02:
                 vix_term = "BACKWARDATION"
-                term_sig = "⚡ BACKWARDATION — Fear spike. Explosive moves both ways."
+                term_sig = "⚡ BACKWARDATION — Fear spike. Explosive moves."
             elif vix_spot < vix3m_val * 0.98:
                 vix_term = "CONTANGO"
                 term_sig = "😴 CONTANGO — Calm market. High chop risk."
@@ -1203,18 +1509,16 @@ def fetch_vix_data():
             vix_term = "UNKNOWN"
             term_sig = "Term structure unavailable"
 
-        # VIX momentum (is VIX rising or falling?)
         vix_momentum = ""
         if len(state["vix_history"]) >= 3:
             vix_roc = state["vix_history"][-1] - state["vix_history"][0]
             if vix_roc > 1.5:
-                vix_momentum = " ↑ RISING — fear building"
+                vix_momentum = " ↑ RISING"
             elif vix_roc < -1.5:
-                vix_momentum = " ↓ FALLING — IV crush, vanna fuel active"
+                vix_momentum = " ↓ FALLING — IV crush, vanna fuel"
             else:
                 vix_momentum = " → STABLE"
 
-        # VIX level signal
         if vix_spot:
             if vix_spot >= 30:
                 vix_sig = f"🔴 EXTREME FEAR ({round(vix_spot,1)}){vix_momentum}"
@@ -1227,16 +1531,15 @@ def fetch_vix_data():
         else:
             vix_sig = "Unavailable"
 
-        # VVIX signal
         if vvix_val:
             if vvix_val >= 100:
-                vvix_sig = f"🔥 EXPLOSIVE ({round(vvix_val,1)}) — Velocity day likely. Full size OK."
+                vvix_sig = f"🔥 EXPLOSIVE ({round(vvix_val,1)}) — Velocity day likely."
             elif vvix_val >= 90:
-                vvix_sig = f"⚡ ACTIVE ({round(vvix_val,1)}) — Good momentum conditions"
+                vvix_sig = f"⚡ ACTIVE ({round(vvix_val,1)}) — Good momentum"
             elif vvix_val >= 85:
                 vvix_sig = f"⚠️ BORDERLINE ({round(vvix_val,1)}) — Needs confirmation"
             else:
-                vvix_sig = f"😴 QUIET ({round(vvix_val,1)}) — Chop day likely. Reduce size."
+                vvix_sig = f"😴 QUIET ({round(vvix_val,1)}) — Chop day likely."
         else:
             vvix_sig = "Unavailable"
 
@@ -1248,24 +1551,14 @@ def fetch_vix_data():
 
 
 # ─────────────────────────────────────────────
-# MODULE 8: PRECISION TICK / INVENTORY READ
-# Adds accuracy from image data patterns observed
+# MODULE 8: TICK + INVENTORY
 # ─────────────────────────────────────────────
 def fetch_tick_and_inventory():
-    """
-    Approximates TICK and inventory bias using SPY intraday data.
-    Based on observed patterns:
-    - TICK neutral (0-400) + 100% neutral inventory = MONITOR/chop
-    - TICK above 600 sustained = institutional accumulation
-    - TICK below -600 sustained = institutional distribution
-    - Inventory MGT score correlates to directional conviction
-    """
     try:
         spy = yf.download("SPY", period="1d", interval="1m", progress=False)
         if spy.empty or len(spy) < 10:
             return "UNAVAILABLE", 0, "NEUTRAL", False
 
-        # Fix for yfinance MultiIndex columns — squeeze to simple Series
         if isinstance(spy.columns, pd.MultiIndex):
             spy.columns = spy.columns.get_level_values(0)
 
@@ -1273,36 +1566,28 @@ def fetch_tick_and_inventory():
         opens = spy["Open"].iloc[-10:].values.flatten().astype(float)
         volumes = spy["Volume"].iloc[-10:].values.flatten().astype(float)
 
-        # TICK approximation
         up_bars = sum(1 for c, o in zip(closes, opens) if c > o)
         down_bars = sum(1 for c, o in zip(closes, opens) if c < o)
         tick_approx = (up_bars - down_bars) * 100
 
-        # Track tick history
         state["tick_history"].append(tick_approx)
         if len(state["tick_history"]) > 6:
             state["tick_history"].pop(0)
 
-        # Sustained tick check (is it consistently one direction?)
-        sustained_bull = len(state["tick_history"]) >= 3 and all(
-            t > 300 for t in state["tick_history"][-3:]
-        )
-        sustained_bear = len(state["tick_history"]) >= 3 and all(
-            t < -300 for t in state["tick_history"][-3:]
-        )
+        sustained_bull = (len(state["tick_history"]) >= 3 and
+                          all(t > 300 for t in state["tick_history"][-3:]))
+        sustained_bear = (len(state["tick_history"]) >= 3 and
+                          all(t < -300 for t in state["tick_history"][-3:]))
 
-        # Session high/low tracking — force scalar with float()
         session_high = float(spy["High"].values.max())
         session_low = float(spy["Low"].values.min())
         state["session_high"] = session_high
         state["session_low"] = session_low
 
-        # Volume surge detection (open drive signal)
         avg_vol = float(np.mean(volumes[:-3])) if len(volumes) > 3 else 0
         recent_vol = float(np.mean(volumes[-3:]))
         volume_surge = recent_vol > avg_vol * 1.5
 
-        # Open drive detection (PDT time)
         pdt = now_pdt()
         mins_since_open = (pdt.hour - 6) * 60 + pdt.minute - 30
         open_drive = False
@@ -1310,11 +1595,11 @@ def fetch_tick_and_inventory():
             open_drive = True
             state["open_drive_detected"] = True
 
-        # Inventory bias from price vs VWAP position
         try:
             spy["vwap"] = (spy["Close"] * spy["Volume"]).cumsum() / spy["Volume"].cumsum()
             current_price = float(spy["Close"].iloc[-1])
             current_vwap = float(spy["vwap"].iloc[-1])
+            state["session_vwap"] = current_vwap
 
             if current_price > current_vwap * 1.002:
                 inventory_bias = "BULL ZONE"
@@ -1325,26 +1610,23 @@ def fetch_tick_and_inventory():
             else:
                 inventory_bias = "NEUTRAL (100%)"
                 state["inventory_bias"] = "NEUTRAL"
-        except:
+        except Exception:
             inventory_bias = "NEUTRAL"
 
-        # Plain English TICK signal
         if tick_approx >= 600 or sustained_bull:
             tick_signal = (
-                f"📈 STRONG BUYING (TICK ~+{tick_approx})\n"
-                f"   {'✅ SUSTAINED' if sustained_bull else 'Single reading'} — "
-                f"{'Open drive detected!' if open_drive else 'Accumulation'}"
+                f"📈 STRONG BUYING (TICK ~+{tick_approx}) "
+                f"{'— Open drive!' if open_drive else '— Accumulation'}"
             )
         elif tick_approx >= 200:
-            tick_signal = f"🟡 MILD BUYING (TICK ~+{tick_approx}) — moderate bullish pressure"
+            tick_signal = f"🟡 MILD BUYING (TICK ~+{tick_approx})"
         elif tick_approx <= -600 or sustained_bear:
             tick_signal = (
-                f"📉 STRONG SELLING (TICK ~{tick_approx})\n"
-                f"   {'✅ SUSTAINED' if sustained_bear else 'Single reading'} — "
-                f"{'Open drive DOWN!' if open_drive else 'Distribution'}"
+                f"📉 STRONG SELLING (TICK ~{tick_approx}) "
+                f"{'— Open drive DOWN!' if open_drive else '— Distribution'}"
             )
         elif tick_approx <= -200:
-            tick_signal = f"🟡 MILD SELLING (TICK ~{tick_approx}) — moderate bearish pressure"
+            tick_signal = f"🟡 MILD SELLING (TICK ~{tick_approx})"
         else:
             tick_signal = (
                 f"⚪ NEUTRAL (TICK ~{tick_approx}) — no conviction\n"
@@ -1360,9 +1642,7 @@ def fetch_tick_and_inventory():
 
 
 # ─────────────────────────────────────────────
-# MODULE 9: PRECISION DIRECTIONAL SCORER
-# Incorporates: GEX + TICK + Inventory + Vanna +
-# VIX momentum + Open Drive + Calendar
+# MODULE 9: CONVICTION SCORER
 # ─────────────────────────────────────────────
 def score_conviction(vix_spot, vvix_val, vix_term, vol_gex, prev_vol_gex,
                       regime, unwind_score, cal_bonus, vanna_window_open,
@@ -1371,7 +1651,6 @@ def score_conviction(vix_spot, vvix_val, vix_term, vol_gex, prev_vol_gex,
     score = 0
     checklist = []
 
-    # VVIX (25pts)
     if vvix_val:
         if vvix_val >= 100:
             score += 25
@@ -1385,114 +1664,92 @@ def score_conviction(vix_spot, vvix_val, vix_term, vol_gex, prev_vol_gex,
         else:
             checklist.append(f"❌ VVIX {round(vvix_val,1)} < 85 — Chop risk (+0)")
 
-    # VIX term (15pts)
     if vix_term == "BACKWARDATION":
         score += 15
-        checklist.append("✅ VIX Backwardation — fear elevated (+15)")
+        checklist.append("✅ VIX Backwardation (+15)")
     elif vix_term == "FLAT":
         score += 7
         checklist.append("⚠️ VIX Flat (+7)")
     else:
         checklist.append("❌ VIX Contango — calm (+0)")
 
-    # VIX momentum bonus (5pts)
     if len(state["vix_history"]) >= 3:
         vix_roc = state["vix_history"][-1] - state["vix_history"][0]
         if abs(vix_roc) > 1.5:
             score += 5
-            direction = "falling ✅ (vanna fuel)" if vix_roc < 0 else "rising ⚠️ (headwind)"
-            checklist.append(f"✅ VIX momentum {direction} (+5)")
+            checklist.append(f"✅ VIX momentum (+5)")
 
-    # Regime (20pts)
     regime_pts = {
-        "HEDGE_UNWIND_CONFIRMED": 20,
-        "BULLISH_MOMENTUM": 18,
-        "BEARISH_HEDGE_BUILD": 16,
-        "HEDGE_UNWIND_EARLY": 14,
-        "TRANSITION_ZONE": 8,
-        "NEUTRAL": 0,
-        "INSUFFICIENT_DATA": 0,
+        "HEDGE_UNWIND_CONFIRMED": 20, "BULLISH_MOMENTUM": 18,
+        "BEARISH_HEDGE_BUILD": 16, "HEDGE_UNWIND_EARLY": 14,
+        "TRANSITION_ZONE": 8, "NEUTRAL": 0, "INSUFFICIENT_DATA": 0,
     }
     rpts = regime_pts.get(regime, 0)
     score += rpts
     emoji = "✅" if rpts >= 14 else "⚠️" if rpts >= 8 else "❌"
     checklist.append(f"{emoji} Regime: {regime} (+{rpts})")
 
-    # Hedge unwind (15pts)
     if unwind_score >= 40:
         score += 15
         checklist.append(f"✅ Hedge unwind confirmed ({unwind_score}/100) (+15)")
     elif unwind_score >= 20:
         score += 8
-        checklist.append(f"⚠️ Early unwind signs ({unwind_score}/100) (+8)")
+        checklist.append(f"⚠️ Early unwind signs (+8)")
     else:
         checklist.append("❌ No unwind detected (+0)")
 
-    # Calendar (max 15pts)
     cal_pts = min(cal_bonus, 15)
     score += cal_pts
-    if cal_pts >= 10:
-        checklist.append(f"✅ Calendar catalyst (+{cal_pts})")
-    elif cal_pts >= 5:
-        checklist.append(f"⚠️ Calendar bonus (+{cal_pts})")
+    if cal_pts >= 5:
+        checklist.append(f"✅ Calendar: +{cal_pts}")
 
-    # Vanna window (10pts)
     if vanna_window_open:
         score += 10
         checklist.append("✅ Vanna window open (+10)")
     else:
         checklist.append("❌ Vanna window closed (+0)")
 
-    # TICK precision (10pts)
     if abs(tick_approx) >= 600:
         score += 10
-        checklist.append(f"✅ TICK strong {'buying' if tick_approx > 0 else 'selling'} (+10)")
+        checklist.append(f"✅ TICK strong (+10)")
     elif abs(tick_approx) >= 300:
         score += 5
-        checklist.append(f"⚠️ TICK moderate (+5)")
+        checklist.append("⚠️ TICK moderate (+5)")
     else:
-        checklist.append(f"❌ TICK neutral ({tick_approx}) — chop risk (+0)")
+        checklist.append(f"❌ TICK neutral ({tick_approx}) (+0)")
 
-    # Inventory bias (5pts)
     if inventory_bias in ["BULL ZONE", "BEAR ZONE"]:
         score += 5
-        checklist.append(f"✅ Inventory: {inventory_bias} — directional (+5)")
+        checklist.append(f"✅ Inventory: {inventory_bias} (+5)")
     else:
-        checklist.append(f"❌ Inventory: NEUTRAL — no bias (+0)")
+        checklist.append("❌ Inventory: NEUTRAL (+0)")
 
-    # Open drive bonus (10pts)
     if open_drive:
         score += 10
-        checklist.append("🚀 OPEN DRIVE DETECTED — institutional conviction (+10)")
+        checklist.append("🚀 OPEN DRIVE DETECTED (+10)")
 
-    # Consolidation penalty (-20pts)
     if conflict:
         score -= 20
-        checklist.append("🚨 Vanna/charm conflict — consolidation risk (-20)")
+        checklist.append("🚨 Vanna/charm conflict (-20)")
 
     score = max(0, min(100, score))
 
     if score >= 80:
-        grade = "A+ 🔥"
-        rec = "FULL SIZE. 400-700% day setup confirmed."
+        grade, rec = "A+ 🔥", "FULL SIZE. 400-700% day setup confirmed."
     elif score >= 65:
-        grade = "B+ ✅"
-        rec = "NORMAL SIZE. 200-400% realistic with right entry."
+        grade, rec = "B+ ✅", "NORMAL SIZE. 200-400% realistic."
     elif score >= 50:
-        grade = "C ⚠️"
-        rec = "HALF SIZE ONLY. Wait for open confirmation."
+        grade, rec = "C ⚠️", "HALF SIZE ONLY. Wait for open confirmation."
     elif score >= 35:
-        grade = "D 🔴"
-        rec = "MINIMAL or sit out. High chop risk."
+        grade, rec = "D 🔴", "MINIMAL or sit out. High chop risk."
     else:
-        grade = "F ❌"
-        rec = "DO NOT TRADE. Theta will destroy premium."
+        grade, rec = "F ❌", "DO NOT TRADE. Theta will destroy premium."
 
     return score, grade, rec, checklist
 
 
 # ─────────────────────────────────────────────
-# HELPERS (original gamma bot)
+# HELPERS
 # ─────────────────────────────────────────────
 def get_gex_state(oi_gex, vol_gex):
     if oi_gex == 0:
@@ -1529,21 +1786,6 @@ def fmt(value_m):
     return f"{s}{a*1000:.0f}K"
 
 
-PDT = timezone(timedelta(hours=-7))
-
-def now_pdt():
-    """Always returns current time in PDT regardless of server timezone."""
-    return datetime.now(timezone.utc).astimezone(PDT)
-
-def is_market_open():
-    pdt = now_pdt()
-    if pdt.weekday() >= 5:
-        return False
-    o = pdt.replace(hour=6, minute=30, second=0, microsecond=0)
-    c = pdt.replace(hour=13, minute=0, second=0, microsecond=0)
-    return o <= pdt <= c
-
-
 async def _send(text):
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=CHAT_ID, text=text)
@@ -1567,12 +1809,12 @@ def get_vwap():
         pv = float(spy["vwap"].iloc[-2]) if len(spy) > 1 else cv
         vol = float(spy["Volume"].iloc[-1])
         return cp, cv, pp, pv, vol
-    except:
+    except Exception:
         return None, None, None, None, None
 
 
 # ─────────────────────────────────────────────
-# VWAP CROSS (original gamma bot — preserved)
+# VWAP CROSS ALERT
 # ─────────────────────────────────────────────
 def check_vwap():
     if not is_market_open():
@@ -1595,19 +1837,16 @@ def check_vwap():
             alert(
                 f"🔽 VWAP CROSS — BEARISH ENTRY\n"
                 f"Price: ${round(cp,2)} | VWAP: ${round(cv,2)}\n"
-                f"Regime: {state['regime']} | Time: {now_str} PDT\n"
-                f"Inventory: {state['inventory_bias']}\n\n"
+                f"Regime: {state['regime']} | {now_str} PDT\n\n"
                 f"⚠️ Confirm candle close below VWAP before entering."
             )
             state["vwap_alert_sent"] = True
-
     elif bullish and not state["vwap_alert_sent"]:
         if pp <= pv and cp > cv:
             alert(
                 f"🔼 VWAP CROSS — BULLISH ENTRY\n"
                 f"Price: ${round(cp,2)} | VWAP: ${round(cv,2)}\n"
-                f"Regime: {state['regime']} | Time: {now_str} PDT\n"
-                f"Inventory: {state['inventory_bias']}\n\n"
+                f"Regime: {state['regime']} | {now_str} PDT\n\n"
                 f"⚠️ Confirm candle close above VWAP before entering."
             )
             state["vwap_alert_sent"] = True
@@ -1617,22 +1856,14 @@ def check_vwap():
 
 
 # ─────────────────────────────────────────────
-# NEW MODULE: HEARTBEAT WATCHDOG
-# Fires every 60 min during market hours
-# regardless of all other alert flags
-# So you always know bot is alive
+# HEARTBEAT WATCHDOG
 # ─────────────────────────────────────────────
 def check_heartbeat():
-    """
-    Sends a simple alive ping every 60 minutes
-    during market hours. Prevents silent failures.
-    """
     if not is_market_open():
         return
     try:
         now_epoch = time.time()
-        last_beat = state.get("last_heartbeat", 0)
-        if now_epoch - last_beat < 3600:  # 60 min
+        if now_epoch - state.get("last_heartbeat", 0) < 3600:
             return
 
         r = get_vwap()
@@ -1640,9 +1871,6 @@ def check_heartbeat():
             return
         cp, cv, _, _, _ = r
         now_str = now_pdt().strftime("%H:%M")
-        regime = state.get("regime", "UNKNOWN")
-        gex_state = state.get("previous_gex_state", "UNKNOWN")
-        conv = state.get("last_conviction_score", 0)
         vwap_dist = round(cp - cv, 2)
         vwap_side = "above" if vwap_dist > 0 else "below"
 
@@ -1650,153 +1878,87 @@ def check_heartbeat():
             f"💓 BOT ALIVE — SPY\n"
             f"{'─'*30}\n"
             f"{now_str} PDT | ${round(cp,2)}\n\n"
-            f"Regime: {regime}\n"
-            f"GEX: {gex_state}\n"
-            f"Conviction: {conv}/100\n"
+            f"Regime: {state.get('regime', 'UNKNOWN')}\n"
+            f"GEX: {state.get('previous_gex_state', 'UNKNOWN')}\n"
+            f"Score: {state.get('last_conviction_score', 0)}/100\n"
             f"VWAP: ${round(cv,2)} "
             f"(${abs(vwap_dist):.2f} {vwap_side})\n\n"
-            f"Bot running normally ✅"
+            f"Bot running ✅"
         )
         state["last_heartbeat"] = now_epoch
-        print(f"💓 Heartbeat sent at {now_str} PDT")
 
     except Exception as e:
         print(f"Heartbeat error: {e}")
 
 
 # ─────────────────────────────────────────────
-# NEW MODULE: DOJI TRANSITION DETECTOR
-# Catches the exact setup you described:
-# Price near VWAP + Vol GEX decelerating
-# + small candle body = transition forming
+# DOJI TRANSITION DETECTOR
 # ─────────────────────────────────────────────
 def check_doji_transition():
-    """
-    Detects when a bearish/bullish trend
-    is transitioning at VWAP.
-
-    Three conditions must align:
-    1. Price within $0.75 of VWAP (doji zone)
-    2. Vol GEX rate of change decelerating
-       (negative but getting less negative
-        OR positive but getting less positive)
-    3. Vol GEX and OI GEX behavior consistent
-       with regime flip starting
-
-    This is the "warning before the warning"
-    — fires BEFORE the regime transition
-    so you can prepare your entry
-    """
     if not is_market_open():
         return
     try:
         r = get_vwap()
         if r[0] is None:
             return
-        cp, cv, pp, pv, _ = r
+        cp, cv, _, _, _ = r
 
-        # Condition 1: Price within $0.75 of VWAP
-        vwap_dist = abs(cp - cv)
-        if vwap_dist > 0.75:
+        if abs(cp - cv) > 0.75:
             state["doji_transition_sent"] = False
             return
 
-        # Condition 2: Vol GEX decelerating
         history = state.get("vol_gex_history", [])
         if len(history) < 3:
             return
 
         recent = history[-3:]
-        vol_gex_current = recent[-1]
-        vol_gex_prev = recent[-2]
-        vol_gex_older = recent[-3]
-
-        # Rate of change slowing down
-        roc_recent = abs(vol_gex_current) - abs(vol_gex_prev)
-        roc_older = abs(vol_gex_prev) - abs(vol_gex_older)
+        roc_recent = abs(recent[-1]) - abs(recent[-2])
+        roc_older = abs(recent[-2]) - abs(recent[-3])
         decelerating = roc_older < 0 and roc_recent > roc_older
 
         if not decelerating:
             return
 
-        # Condition 3: Don't fire if already in transition/unwind
         regime = state.get("regime", "")
         if regime in ["HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM"]:
             return
-
-        # Already sent for this doji formation
         if state.get("doji_transition_sent"):
             return
 
         now_str = now_pdt().strftime("%H:%M")
-        prev_regime = state.get("previous_regime", "")
+        vol_gex_current = recent[-1]
+        vol_gex_prev = recent[-2]
 
-        # Determine likely transition direction
         if vol_gex_current < 0 and roc_recent > 0:
-            # Negative but improving = bullish transition
             direction = "BEARISH → BULLISH"
-            action = "Watch for Vol GEX flip positive\n→ Calls on VWAP break above"
-            emoji = "🔄"
+            action = "Watch for Vol GEX flip positive → Calls on VWAP break above"
         elif vol_gex_current > 0 and roc_recent < 0:
-            # Positive but deteriorating = bearish transition
             direction = "BULLISH → BEARISH"
-            action = "Watch for Vol GEX flip negative\n→ Puts on VWAP break below"
-            emoji = "🔄"
+            action = "Watch for Vol GEX flip negative → Puts on VWAP break below"
         else:
             direction = "CONSOLIDATING"
-            action = "No clear direction yet\n→ Wait for Vol GEX commitment"
-            emoji = "⚠️"
-
-        vol_fmt_current = fmt(vol_gex_current / (650 * 6.31) / 1e6)
-        vol_fmt_prev = fmt(vol_gex_prev / (650 * 6.31) / 1e6)
+            action = "No clear direction yet → Wait for commitment"
 
         alert(
-            f"{emoji} DOJI TRANSITION FORMING — SPY\n"
+            f"🔄 DOJI TRANSITION FORMING — SPY\n"
             f"{'─'*35}\n"
-            f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
-            f"VWAP: ${round(cv,2)} "
-            f"(only ${vwap_dist:.2f} away)\n\n"
-            f"🔍 WHAT IS HAPPENING\n"
+            f"{now_str} PDT | Price: ${round(cp,2)}\n"
+            f"VWAP: ${round(cv,2)} (${abs(cp-cv):.2f} away)\n\n"
             f"Transition: {direction}\n"
-            f"Vol GEX decelerating:\n"
-            f"  Previous: {vol_fmt_prev}\n"
-            f"  Current:  {vol_fmt_current}\n"
-            f"  → Momentum losing steam\n\n"
-            f"📊 CANDLE SIGNAL\n"
-            f"Doji forming at VWAP\n"
-            f"Price indecision = institutions\n"
-            f"pausing before next move\n\n"
-            f"🎯 ACTION\n"
-            f"{action}\n\n"
-            f"⚠️ NOT A TRADE SIGNAL YET\n"
-            f"Wait for Vol GEX to confirm direction\n"
-            f"Next scheduled reading will clarify"
+            f"Vol GEX decelerating — momentum losing steam\n\n"
+            f"Action: {action}\n\n"
+            f"⚠️ NOT A TRADE SIGNAL YET — wait for Vol GEX to confirm"
         )
         state["doji_transition_sent"] = True
-        print(f"Doji transition alert: {direction} at {now_str} PDT")
 
     except Exception as e:
         print(f"Doji transition error: {e}")
 
 
 # ─────────────────────────────────────────────
-# NEW MODULE: GAMMA WALL APPROACH / TP ALERT
-# Fires when price approaches a major gamma
-# wall — tells you TP zone is near
-# Solves the "missed 655-657 exit" problem
+# GAMMA WALL APPROACH / TP ALERT
 # ─────────────────────────────────────────────
 def check_gamma_wall_approach():
-    """
-    Detects when price is within $1.50 of
-    a significant gamma wall and alerts:
-    - If approaching from below (bounce):
-      → Take profits on calls, watch for rejection
-    - If approaching from above (dump):
-      → Take profits on puts, watch for bounce
-
-    Uses vanna targets and OI concentration
-    as wall estimates.
-    """
     if not is_market_open():
         return
     try:
@@ -1806,79 +1968,48 @@ def check_gamma_wall_approach():
         cp, cv, _, _, _ = r
 
         vanna_target = state.get("current_vanna_target")
-        charm_target = state.get("current_charm_target")
-        regime = state.get("previous_regime", "")
-        gex_state = state.get("previous_gex_state", "")
-        now_str = now_pdt().strftime("%H:%M")
+        if not vanna_target:
+            return
 
-        # Don't spam — only fire once per wall per session
+        now_str = now_pdt().strftime("%H:%M")
         last_wall_alert = state.get("last_wall_alert_price", 0)
         if abs(cp - last_wall_alert) < 2.0:
             return
 
-        # Check vanna target approach
-        if vanna_target:
-            dist_to_vanna = vanna_target - cp
-            abs_dist = abs(dist_to_vanna)
+        dist_to_vanna = vanna_target - cp
+        abs_dist = abs(dist_to_vanna)
 
-            if abs_dist <= 1.5:
-                approaching_from = "below" if dist_to_vanna > 0 else "above"
+        if abs_dist > 1.5:
+            return
 
-                if approaching_from == "below":
-                    # Price running UP toward vanna target
-                    # Tell user to take profits on calls
-                    alert(
-                        f"🎯 VANNA TARGET APPROACHING — SPY\n"
-                        f"{'─'*35}\n"
-                        f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
-                        f"Vanna target: ${vanna_target} "
-                        f"(${abs_dist:.2f} away)\n\n"
-                        f"💰 PROFIT ZONE — CALLS\n"
-                        f"If holding calls from lower:\n"
-                        f"→ THIS IS YOUR EXIT ZONE\n"
-                        f"→ Sell calls between "
-                        f"${round(vanna_target-0.5,0)}-${vanna_target}\n"
-                        f"→ Do NOT hold past the target\n\n"
-                        f"⚠️ WHAT HAPPENS AT THE WALL\n"
-                        f"Charm force reverses at ${vanna_target}\n"
-                        f"MMs start selling delta above here\n"
-                        f"Rally stalls or reverses\n\n"
-                        f"🔄 AFTER TARGET HIT\n"
-                        f"Watch Vol GEX — if flips negative\n"
-                        f"→ Put re-entry at ${vanna_target}"
-                    )
-                    state["last_wall_alert_price"] = cp
-                    print(f"Vanna target approach alert (from below) at {now_str}")
+        approaching_from = "below" if dist_to_vanna > 0 else "above"
 
-                elif approaching_from == "above":
-                    # Price falling DOWN toward vanna target
-                    # Tell user to take profits on puts
-                    alert(
-                        f"🎯 SUPPORT ZONE APPROACHING — SPY\n"
-                        f"{'─'*35}\n"
-                        f"Time: {now_str} PDT | Price: ${round(cp,2)}\n"
-                        f"Vanna support: ${vanna_target} "
-                        f"(${abs_dist:.2f} away)\n\n"
-                        f"💰 PROFIT ZONE — PUTS\n"
-                        f"If holding puts from higher:\n"
-                        f"→ Consider partial profit here\n"
-                        f"→ Vanna support at ${vanna_target} "
-                        f"may cause bounce\n"
-                        f"→ Sell half, keep half for break\n\n"
-                        f"⚠️ WHAT HAPPENS AT THE WALL\n"
-                        f"Charm +{round(abs(charm_target or 0)/1e6,0)}M "
-                        f"support at this level\n"
-                        f"MMs forced to buy delta here\n"
-                        f"Puts may stall or reverse\n\n"
-                        f"🔄 IF WALL BREAKS\n"
-                        f"Hold remaining puts\n"
-                        f"Next target: ${round(vanna_target - 5, 0)}"
-                    )
-                    state["last_wall_alert_price"] = cp
-                    print(f"Support approach alert (from above) at {now_str}")
+        if approaching_from == "below":
+            alert(
+                f"🎯 VANNA TARGET APPROACHING — SPY\n"
+                f"{'─'*35}\n"
+                f"{now_str} PDT | Price: ${round(cp,2)}\n"
+                f"Vanna target: ${vanna_target} (${abs_dist:.2f} away)\n\n"
+                f"💰 IF HOLDING CALLS — THIS IS YOUR EXIT ZONE\n"
+                f"Sell between ${round(vanna_target-0.5,0)}-${vanna_target}\n"
+                f"Charm reverses above this level. Don't hold past it.\n\n"
+                f"After target hit: watch Vol GEX for put re-entry signal."
+            )
+        else:
+            alert(
+                f"🎯 SUPPORT ZONE APPROACHING — SPY\n"
+                f"{'─'*35}\n"
+                f"{now_str} PDT | Price: ${round(cp,2)}\n"
+                f"Vanna support: ${vanna_target} (${abs_dist:.2f} away)\n\n"
+                f"💰 IF HOLDING PUTS — Consider partial profit here\n"
+                f"Vanna support may cause bounce. Sell half, keep half.\n\n"
+                f"If wall breaks: hold remaining puts toward next level."
+            )
+
+        state["last_wall_alert_price"] = cp
 
     except Exception as e:
-        print(f"Gamma wall approach error: {e}")
+        print(f"Gamma wall error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1887,8 +2018,8 @@ def check_gamma_wall_approach():
 def check_consolidation_job():
     if not is_market_open():
         return
+
     pdt = now_pdt()
-    now = pdt
     mins = (pdt.hour - 6) * 60 + pdt.minute - 30
     if mins > 45 or mins < 5 or state["consolidation_alert_sent"]:
         return
@@ -1911,26 +2042,18 @@ def check_consolidation_job():
 
         vt, vs, ct, cs, conflict = fetch_vanna_charm()
         is_cons, score, signals = run_consolidation_check(cp, iv, vol, vt, ct, conflict)
-        now_str = now.strftime("%H:%M")
+        now_str = pdt.strftime("%H:%M")
 
         if is_cons:
             sigs = "\n".join(signals)
             alert(
                 f"🚨 CONSOLIDATION TRAP WARNING — SPY\n"
                 f"{'─'*35}\n"
-                f"Time: {now_str} | Price: ${cp:.2f}\n"
-                f"Score: {score}/100\n\n"
+                f"{now_str} | ${cp:.2f} | Score: {score}/100\n\n"
                 f"⚠️ SIGNALS\n{sigs}\n\n"
-                f"💡 WHAT IS HAPPENING\n"
-                f"Vanna pulling UP toward ${vt}\n"
-                f"Charm pushing DOWN toward ${ct}\n"
-                f"Forces CANCELING = premium decays fast.\n\n"
+                f"Vanna + charm forces canceling = premium decays fast.\n\n"
                 f"🚫 DO NOT TRADE THIS OPEN\n"
-                f"Wait for:\n"
-                f"→ Price moves >1% from ${vt} with volume\n"
-                f"→ IV expands >3% from open\n"
-                f"→ TICK holds +600 or -600 for 15+ min\n"
-                f"→ Hedge unwind score >40\n\n"
+                f"Wait for >1% move with volume OR TICK ±600 sustained.\n"
                 f"Re-assess after 10:00am PDT."
             )
             state["consolidation_alert_sent"] = True
@@ -1941,78 +2064,9 @@ def check_consolidation_job():
 
 
 # ─────────────────────────────────────────────
-# GIT AUTO-COMMIT
-# Saves CSV to GitHub after EOD
-# Requires GITHUB_TOKEN in Railway vars
-# ─────────────────────────────────────────────
-def git_commit_log():
-    try:
-        import subprocess
-        github_token = os.getenv("GITHUB_TOKEN", "")
-        github_repo = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
-
-        if not github_token:
-            print("⚠️ GITHUB_TOKEN not set — CSV not committed")
-            return
-
-        today_str = now_pdt().strftime("%Y-%m-%d")
-        remote_url = f"https://{github_token}@github.com/{github_repo}.git"
-
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", remote_url],
-            check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "gammabot@railway.app"],
-            check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "GammaBot"],
-            check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "add", LOG_FILE],
-            check=True, capture_output=True
-        )
-
-        result = subprocess.run(
-            ["git", "diff", "--staged", "--quiet"],
-            capture_output=True
-        )
-        if result.returncode == 0:
-            print("📝 No new CSV data to commit")
-            return
-
-        subprocess.run([
-            "git", "commit", "-m",
-            f"Auto-log: SPY GEX data {today_str}"
-        ], check=True, capture_output=True)
-
-        subprocess.run(
-            ["git", "push", "origin", "main"],
-            check=True, capture_output=True
-        )
-        print(f"✅ CSV committed to GitHub: {today_str}")
-
-    except subprocess.CalledProcessError as e:
-        print(f"Git commit error: {e}")
-    except Exception as e:
-        print(f"Git commit error (non-critical): {e}")
-
-
-# ─────────────────────────────────────────────
 # END OF DAY AUTO-FILL
 # ─────────────────────────────────────────────
 def eod_autofill(close_price):
-    """
-    At market close (1pm PDT), automatically fills:
-    - outcome_direction: UP / DOWN / CHOP
-    - outcome_points: how many points SPY moved
-    - signal_correct: whether the morning GEX signal was right
-
-    Only fills rows from today that are still blank.
-    You still manually fill: notes column for context.
-    """
     try:
         today_str = now_pdt().strftime("%Y-%m-%d")
 
@@ -2027,8 +2081,8 @@ def eod_autofill(close_price):
         if not rows:
             return
 
-        # Find today's opening price from first log entry of today
-        today_rows = [r for r in rows if r["date"] == today_str]
+        today_rows = [r for r in rows
+                      if r["date"] == today_str and r.get("session_type") == "MARKET"]
         if not today_rows:
             return
 
@@ -2042,7 +2096,6 @@ def eod_autofill(close_price):
         else:
             direction = "DOWN"
 
-        # Get morning signal — first directional reading of the day
         morning_signal = None
         for r in today_rows:
             if "DIRECTIONAL" in r.get("gex_state", ""):
@@ -2052,7 +2105,6 @@ def eod_autofill(close_price):
                 morning_signal = r["gex_state"]
                 break
 
-        # Determine if signal was correct
         if morning_signal and "DIRECTIONAL" in morning_signal:
             if "BEARISH" in morning_signal and direction == "DOWN":
                 correct = "YES"
@@ -2067,11 +2119,10 @@ def eod_autofill(close_price):
         else:
             correct = ""
 
-        # Pull session stats BEFORE the rows loop
+        # Pull session stats BEFORE rows loop
         session_high = state.get("session_high") or close_price
         session_low = state.get("session_low") or close_price
 
-        # Update today's rows that have blank outcome columns
         updated = 0
         for r in rows:
             if r["date"] == today_str and r["outcome_direction"] == "":
@@ -2082,16 +2133,24 @@ def eod_autofill(close_price):
                 r["max_move_down"] = round(open_price - session_low, 2) if session_low else ""
                 updated += 1
 
-        # Write back to CSV
         with open(LOG_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
             writer.writeheader()
             writer.writerows(rows)
 
-        # Auto-commit to GitHub — data survives redeployments
+        # Save VIX and GEX snapshots for overnight comparison
+        state["overnight_vix_close"] = state["vix_history"][-1] if state["vix_history"] else None
+        state["overnight_gex_snapshot"] = {
+            "oi": state.get("previous_oi_gex"),
+            "vol": state.get("previous_vol_gex")
+        }
+        # Reset overnight alert counter for new session
+        state["overnight_alerts_today"] = 0
+        state["overnight_report_sent"] = False
+
+        # Commit to GitHub
         git_commit_log()
 
-        # Send end of day summary to Telegram
         now_str = now_pdt().strftime("%H:%M")
         signal_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
         max_up = round(session_high - open_price, 2)
@@ -2101,10 +2160,11 @@ def eod_autofill(close_price):
             f"Date: {today_str}\n"
             f"Open: ${round(open_price,2)} | Close: ${round(close_price,2)}\n"
             f"Move: {'+' if point_move > 0 else ''}{point_move} pts ({direction})\n"
-            f"Max up from open: +{max_up} | Max down: -{max_down}\n"
+            f"Max up: +{max_up} | Max down: -{max_down}\n"
             f"Morning signal: {morning_signal or 'None'}\n"
             f"Signal correct: {correct}\n"
-            f"Rows logged: {updated}"
+            f"Rows logged: {updated}\n"
+            f"Overnight monitoring will continue until 6am tomorrow."
         )
 
         written = write_alert_with_claude(
@@ -2115,14 +2175,12 @@ def eod_autofill(close_price):
             vol_gex=state.get("previous_vol_gex", 0) or 0,
             oi_gex=state.get("previous_oi_gex", 0) or 0,
             ratio=0, vix=0, vvix=0,
-            conviction=0, combined=0,
-            unwind_score=0,
+            conviction=0, combined=0, unwind_score=0,
             vanna_target=None, charm_target=None,
             news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
             catalyst_type=state.get("last_catalyst_type", "NONE"),
             macro_override=state.get("last_macro_override", "NO"),
-            flow_dir="",
-            previous_regime="", previous_gex_state="",
+            flow_dir="", previous_regime="", previous_gex_state="",
             claude_verdict="",
             extra_context=eod_context
         )
@@ -2132,38 +2190,36 @@ def eod_autofill(close_price):
                 f"📊 END OF DAY — SPY\n"
                 f"{'─'*35}\n"
                 f"{today_str} | {now_str} PDT\n"
-                f"Open ${round(open_price,2)} → Close ${round(close_price,2)} "
+                f"${round(open_price,2)} → ${round(close_price,2)} "
                 f"({'+' if point_move > 0 else ''}{point_move} pts) "
                 f"{signal_emoji}\n\n"
                 f"{written}\n\n"
-                f"💾 {updated} rows saved to GitHub\n"
-                f"💬 /notes to add context"
+                f"💾 {updated} rows saved\n"
+                f"🌙 Overnight monitoring active"
             )
         else:
             alert(
-                f"📊 END OF DAY SUMMARY — SPY\n"
+                f"📊 END OF DAY — SPY\n"
                 f"{'─'*35}\n"
-                f"Date: {today_str} | {now_str} PDT\n\n"
-                f"Open:  ${round(open_price, 2)}\n"
-                f"Close: ${round(close_price, 2)}\n"
-                f"Move:  {'+' if point_move > 0 else ''}{point_move} pts\n"
-                f"Direction: {direction}\n"
+                f"{today_str} | {now_str} PDT\n\n"
+                f"Open: ${round(open_price,2)} → Close: ${round(close_price,2)}\n"
+                f"Move: {'+' if point_move > 0 else ''}{point_move} pts ({direction})\n"
                 f"Max Up: +{max_up} | Max Down: -{max_down}\n\n"
                 f"Signal: {morning_signal or 'None'}\n"
                 f"Correct: {signal_emoji} {correct}\n\n"
                 f"📝 {updated} rows logged\n"
-                f"💾 CSV saved to GitHub\n"
-                f"💬 /notes to add context"
+                f"💾 CSV saved | 💬 /notes to add context\n"
+                f"🌙 Overnight monitoring active"
             )
 
-        print(f"EOD complete — {updated} rows | {direction} {point_move}pts | {correct}")
+        print(f"EOD complete — {updated} rows | {direction} {point_move}pts")
 
     except Exception as e:
         print(f"EOD autofill error: {e}")
 
 
 # ─────────────────────────────────────────────
-# MAIN JOB — unified
+# MAIN JOB — daytime
 # ─────────────────────────────────────────────
 def run_job():
     pdt = now_pdt()
@@ -2171,7 +2227,6 @@ def run_job():
     print(f"\n{'='*60}\nJob: {now_str} PDT\n{'='*60}")
 
     try:
-        # ── Core GEX (original gamma bot) ──
         oi_gex, vol_gex, price = fetch_gex()
         if oi_gex is None:
             print("No GEX data")
@@ -2180,7 +2235,6 @@ def run_job():
             print(f"Pre-market. OI: {round(oi_gex/1e9,2)}B | Price: ${price}")
             return
 
-        # Update vol GEX history
         state["vol_gex_history"].append(vol_gex)
         if len(state["vol_gex_history"]) > 10:
             state["vol_gex_history"].pop(0)
@@ -2195,14 +2249,13 @@ def run_job():
         vol_fmt = format_gex(vol_m)
         ratio_r = round(ratio, 2)
 
-        # ── All intelligence modules ──
         vix_spot, vvix_val, vix_term, term_sig, vix_sig, vvix_sig = fetch_vix_data()
         vt, vs, ct, cs, conflict = fetch_vanna_charm()
         vc_text, vanna_window = get_vanna_charm_read(vt, vs, ct, cs, price, conflict)
 
-        # Store for gamma wall checker
         state["current_vanna_target"] = vt
         state["current_charm_target"] = ct
+
         unwind_det, unwind_score, unwind_sigs, flow_dir = fetch_hedge_unwind_signals()
         regime, reg_conf = detect_regime(oi_gex, vol_gex, state["vol_gex_history"])
         reg_signal = get_regime_signal(regime, reg_conf, oi_b, vol_b)
@@ -2216,15 +2269,10 @@ def run_job():
             tick_approx, inventory_bias, open_drive
         )
 
-        # Console log
         print(f"${price} | {gex_state} | Regime:{regime} | Score:{conv}")
         print(f"OI:{oi_b}B ({oi_fmt}) | VOL:{vol_b}B ({vol_fmt}) | Ratio:{ratio_r}x")
-        print(f"VIX:{vix_sig} | VVIX:{vvix_sig}")
-        print(f"Flow:{flow_dir} | Grade:{grade}")
 
-        # ── AI VERIFICATION ──
-        # Only call Claude when there's a meaningful signal
-        # to avoid wasting API credits on neutral readings
+        # AI verification — only for meaningful signals
         should_verify = (
             conv >= 50 or
             regime in ["BEARISH_HEDGE_BUILD", "HEDGE_UNWIND_CONFIRMED",
@@ -2240,81 +2288,49 @@ def run_job():
         combined_score = conv
 
         if should_verify and anthropic_client:
-            signal_desc = (
-                f"{gex_state} regime={regime} "
-                f"conviction={conv}/100 unwind={unwind_score}/100"
-            )
+            signal_desc = (f"{gex_state} regime={regime} "
+                           f"conviction={conv}/100 unwind={unwind_score}/100")
             claude_verdict, claude_confidence, claude_reasoning, combined_score = \
                 verify_signal_with_claude(
-                    signal_type=signal_desc,
-                    price=price,
-                    gex_state=gex_state,
-                    regime=regime,
-                    vol_gex=vol_gex,
-                    oi_gex=oi_gex,
-                    ratio=ratio,
-                    vix=vix_spot,
-                    vvix=vvix_val,
+                    signal_type=signal_desc, price=price,
+                    gex_state=gex_state, regime=regime,
+                    vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
+                    vix=vix_spot, vvix=vvix_val,
                     news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
                     catalyst_type=state.get("last_catalyst_type", "NONE"),
                     macro_override=state.get("last_macro_override", "NO"),
-                    conviction_score=conv,
-                    unwind_score=unwind_score,
-                    vanna_target=vt,
-                    charm_target=ct
+                    conviction_score=conv, unwind_score=unwind_score,
+                    vanna_target=vt, charm_target=ct
                 )
 
-        # Format AI verdict for alerts
         verdict_emoji = (
             "✅" if claude_verdict == "CONFIRM" else
             "⚠️" if claude_verdict == "CHALLENGE" else
-            "➖" if claude_verdict == "NEUTRAL" else
-            "🔇"
+            "➖" if claude_verdict == "NEUTRAL" else "🔇"
         )
         ai_line = (
-            f"\n🤖 AI VERIFY: {verdict_emoji} {claude_verdict} "
-            f"({claude_confidence}%)\n"
+            f"\n🤖 AI: {verdict_emoji} {claude_verdict} ({claude_confidence}%)\n"
             f"→ {claude_reasoning[:300]}\n"
-            f"Combined Score: {combined_score}/100"
+            f"Combined: {combined_score}/100"
             if claude_verdict not in ["SKIPPED", "UNAVAILABLE"]
             else ""
         )
 
-        # ── LOG EVERY READING TO CSV ──
-        # Store news state for AI verification
-        state["last_news_sentiment"] = state.get("last_news_sentiment", "NEUTRAL")
-        state["last_catalyst_type"] = state.get("last_catalyst_type", "NONE")
-        state["last_macro_override"] = state.get("last_macro_override", "NO")
-
         log_reading(
-            price=price,
-            oi_gex=oi_gex,
-            vol_gex=vol_gex,
-            oi_m=oi_m,
-            vol_m=vol_m,
-            ratio=ratio,
-            gex_state=gex_state,
-            regime=regime,
-            conv=conv,
-            grade=grade,
-            vix_spot=vix_spot,
-            vvix_val=vvix_val,
-            vix_term=vix_term,
-            tick_approx=tick_approx,
-            inventory_bias=inventory_bias,
-            unwind_score=unwind_score,
-            open_drive=open_drive,
-            vanna_target=vt,
-            charm_target=ct,
-            cal_flags=cal_flags,
-            days_opex=days_opex,
-            claude_verdict=claude_verdict,
-            claude_confidence=claude_confidence,
-            claude_reasoning=claude_reasoning,
-            combined_score=combined_score
+            price=price, oi_gex=oi_gex, vol_gex=vol_gex,
+            oi_m=oi_m, vol_m=vol_m, ratio=ratio,
+            gex_state=gex_state, regime=regime,
+            conv=conv, grade=grade,
+            vix_spot=vix_spot, vvix_val=vvix_val, vix_term=vix_term,
+            tick_approx=tick_approx, inventory_bias=inventory_bias,
+            unwind_score=unwind_score, open_drive=open_drive,
+            vanna_target=vt, charm_target=ct,
+            cal_flags=cal_flags, days_opex=days_opex,
+            claude_verdict=claude_verdict, claude_confidence=claude_confidence,
+            claude_reasoning=claude_reasoning, combined_score=combined_score
         )
 
-        # ── ORIGINAL GAMMA BOT: GEX STATE CHANGE ──
+        # GEX state change alert
         if gex_state != state["previous_gex_state"]:
             emojis = {
                 "NEUTRAL": "⚪", "WATCH": "⚠️",
@@ -2323,25 +2339,20 @@ def run_job():
                 "COUNTER": "🔄"
             }
             emoji = emojis.get(gex_state, "❓")
-
             alert(
                 f"{emoji} SPY GEX SIGNAL\n\n"
                 f"State: {gex_state}\n"
-                f"OI Net GEX: {oi_fmt} ({oi_b}B raw)\n"
-                f"VOL Net GEX: {vol_fmt} ({vol_b}B raw)\n"
-                f"Ratio: {ratio_r}x\n"
-                f"Spot: ${price}\n"
-                f"Time: {now_str} PDT\n"
-                f"Previous: {state['previous_gex_state'] or 'None'}\n\n"
+                f"OI Net GEX: {oi_fmt} ({oi_b}B)\n"
+                f"VOL Net GEX: {vol_fmt} ({vol_b}B)\n"
+                f"Ratio: {ratio_r}x | Spot: ${price} | {now_str} PDT\n\n"
                 f"📊 REGIME: {regime} ({reg_conf}%)\n"
                 f"🎯 CONVICTION: {conv}/100 — {grade}\n"
                 f"→ {rec}"
                 f"{ai_line}"
             )
-            print(f"GEX state alert: {state['previous_gex_state']} → {gex_state}")
 
-        # ── REGIME CHANGE ALERT ──
-        if regime != state["previous_regime"] and regime not in ["INSUFFICIENT_DATA"]:
+        # Regime change alert
+        if regime != state["previous_regime"] and regime != "INSUFFICIENT_DATA":
             prev = state["previous_regime"] or "None"
             key_transitions = [
                 ("BEARISH_HEDGE_BUILD", "TRANSITION_ZONE"),
@@ -2354,23 +2365,18 @@ def run_job():
             r_emoji = "🚨" if is_key else "🔄"
 
             cl_text = "\n".join(checklist)
-            uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None"
-            cal_text = "\n".join(cal_flags) if cal_flags else "No special events"
 
-            # Try Claude-written alert first
             written = write_alert_with_claude(
                 alert_type="regime_transition",
                 price=price, gex_state=gex_state, regime=regime,
                 vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
                 vix=vix_spot, vvix=vvix_val,
                 conviction=conv, combined=combined_score,
-                unwind_score=unwind_score,
-                vanna_target=vt, charm_target=ct,
+                unwind_score=unwind_score, vanna_target=vt, charm_target=ct,
                 news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
                 catalyst_type=state.get("last_catalyst_type", "NONE"),
                 macro_override=state.get("last_macro_override", "NO"),
-                flow_dir=flow_dir,
-                previous_regime=prev,
+                flow_dir=flow_dir, previous_regime=prev,
                 previous_gex_state=state.get("previous_gex_state", ""),
                 claude_verdict=claude_verdict
             )
@@ -2383,36 +2389,32 @@ def run_job():
                     f"{written}"
                 )
             else:
-                # Template fallback
                 alert(
                     f"{r_emoji} REGIME TRANSITION — SPY\n"
                     f"{'─'*35}\n"
                     f"NEW: {regime} | WAS: {prev}\n"
-                    f"Confidence: {reg_conf}%\n"
-                    f"Time: {now_str} PDT | Price: ${price}\n\n"
-                    f"📊 REGIME MEANING\n{reg_signal}\n\n"
-                    f"📈 VANNA / CHARM\n{vc_text}\n\n"
-                    f"🎯 CONVICTION: {conv}/100 — {grade}\n"
-                    f"→ {rec}\n\n"
+                    f"Confidence: {reg_conf}% | {now_str} PDT | ${price}\n\n"
+                    f"{reg_signal}\n\n"
+                    f"📈 VANNA/CHARM\n{vc_text}\n\n"
+                    f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}\n\n"
                     f"📋 CHECKLIST\n{cl_text}"
                     f"{ai_line}"
                 )
-            print(f"Regime alert: {prev} → {regime}")
+            # Track regime transitions for ML
+            state["regime_transitions_today"] = state.get("regime_transitions_today", 0) + 1
 
-        # ── HEDGE UNWIND STANDALONE ──
+        # Hedge unwind standalone
         elif (unwind_det and not state["hedge_unwind_alert_sent"]
               and unwind_score >= 40
               and regime == state["previous_regime"]):
             uw_text = "\n".join(unwind_sigs)
-
             written = write_alert_with_claude(
                 alert_type="hedge_unwind",
                 price=price, gex_state=gex_state, regime=regime,
                 vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
                 vix=vix_spot, vvix=vvix_val,
                 conviction=conv, combined=combined_score,
-                unwind_score=unwind_score,
-                vanna_target=vt, charm_target=ct,
+                unwind_score=unwind_score, vanna_target=vt, charm_target=ct,
                 news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
                 catalyst_type=state.get("last_catalyst_type", "NONE"),
                 macro_override=state.get("last_macro_override", "NO"),
@@ -2422,7 +2424,6 @@ def run_job():
                 claude_verdict=claude_verdict,
                 extra_context=f"Flow signals:\n{uw_text}"
             )
-
             if written:
                 alert(
                     f"🚀 HEDGE UNWIND — SPY\n"
@@ -2434,13 +2435,11 @@ def run_job():
                 alert(
                     f"🚀 HEDGE UNWIND DETECTED — SPY\n"
                     f"{'─'*35}\n"
-                    f"Score: {unwind_score}/100 | Flow: {flow_dir}\n"
-                    f"Time: {now_str} PDT | Price: ${price}\n\n"
-                    f"📊 FLOW SIGNALS\n{uw_text}\n\n"
+                    f"Score: {unwind_score}/100 | {now_str} PDT | ${price}\n\n"
+                    f"📊 FLOW\n{uw_text}\n\n"
                     f"Institutions selling puts = MMs buy shares back.\n"
-                    f"Price rises with ZERO new call buying needed.\n\n"
                     f"📈 VANNA TARGET: ${vt}\n\n"
-                    f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}"
+                    f"🎯 {conv}/100 — {grade}\n→ {rec}"
                     f"{ai_line}"
                 )
             state["hedge_unwind_alert_sent"] = True
@@ -2449,7 +2448,7 @@ def run_job():
         if unwind_score < 20:
             state["hedge_unwind_alert_sent"] = False
 
-        # ── ORIGINAL GAMMA BOT: CONVICTION INCREASE ──
+        # Conviction spike
         if ("DIRECTIONAL" in gex_state and state["previous_ratio"]
                 and ratio - state["previous_ratio"] > 0.3):
             direction = "BEARISH" if oi_gex < 0 else "BULLISH"
@@ -2457,23 +2456,13 @@ def run_job():
                 f"📈 CONVICTION INCREASING — SPY\n\n"
                 f"Direction: {direction}\n"
                 f"Ratio: {ratio_r}x (was {round(state['previous_ratio'],2)}x)\n"
-                f"OI Net GEX: {oi_fmt}\n"
-                f"VOL Net GEX: {vol_fmt}\n"
-                f"Spot: ${price}\n"
-                f"Time: {now_str}\n\n"
-                f"VIX: {vix_sig}\n"
-                f"VVIX: {vvix_sig}\n"
-                f"TICK: {tick_signal}\n\n"
+                f"OI: {oi_fmt} | VOL: {vol_fmt} | ${price} | {now_str}\n\n"
+                f"VIX: {vix_sig} | VVIX: {vvix_sig}\n"
                 f"🎯 Score: {conv}/100 — {grade}\n→ {rec}"
             )
 
-        # ── MORNING VELOCITY REPORT ──
-        pdt_now = now_pdt()
-        h, m = pdt_now.hour, pdt_now.minute
-
-        # FIX 1: Morning report fires once at open
-        # BUT re-fires if conviction score changes significantly
-        # so you never miss a major setup shift after 6:30am
+        # Morning velocity report
+        h, m = pdt.hour, pdt.minute
         if (h == 6 and m >= 25) or (h == 7 and m <= 15):
             conviction_changed = (
                 state["last_conviction_score"] is not None and
@@ -2489,8 +2478,7 @@ def run_job():
                     vol_gex=vol_gex, oi_gex=oi_gex, ratio=ratio,
                     vix=vix_spot, vvix=vvix_val,
                     conviction=conv, combined=combined_score,
-                    unwind_score=unwind_score,
-                    vanna_target=vt, charm_target=ct,
+                    unwind_score=unwind_score, vanna_target=vt, charm_target=ct,
                     news_sentiment=state.get("last_news_sentiment", "NEUTRAL"),
                     catalyst_type=state.get("last_catalyst_type", "NONE"),
                     macro_override=state.get("last_macro_override", "NO"),
@@ -2498,7 +2486,7 @@ def run_job():
                     previous_regime=state.get("previous_regime", ""),
                     previous_gex_state=state.get("previous_gex_state", ""),
                     claude_verdict=claude_verdict,
-                    extra_context=f"Calendar: {cal_text}\nVIX signal: {vix_sig}\nVVIX signal: {vvix_sig}"
+                    extra_context=f"Calendar: {cal_text}\nVIX: {vix_sig}\nVVIX: {vvix_sig}"
                 )
 
                 if written:
@@ -2509,77 +2497,48 @@ def run_job():
                         f"{written}"
                     )
                 else:
-                    # Template fallback
                     cl_text = "\n".join(checklist)
-                    uw_text = "\n".join(unwind_sigs) if unwind_sigs else "None yet"
                     alert(
                         f"🌅 {update_tag}PRE-MARKET REPORT — SPY\n"
                         f"{'─'*35}\n"
                         f"{now_str} PDT | ${price}\n\n"
-                        f"🎯 CONVICTION: {conv}/100\n"
-                        f"Grade: {grade}\n"
-                        f"→ {rec}\n\n"
+                        f"🎯 CONVICTION: {conv}/100 — {grade}\n→ {rec}\n\n"
                         f"📋 CHECKLIST\n{cl_text}\n\n"
-                        f"🔄 REGIME: {regime}\n{reg_signal}\n\n"
-                        f"VIX: {vix_sig}\n"
-                        f"VVIX: {vvix_sig}\n\n"
-                        f"⚡ GUIDE\n"
-                        f"80-100 → Full size.\n"
-                        f"65-79 → Normal size.\n"
-                        f"50-64 → Half size.\n"
-                        f"Below 50 → Sit out."
+                        f"VIX: {vix_sig}\nVVIX: {vvix_sig}"
                     )
                 state["velocity_score_sent"] = True
-                print(f"Morning report sent. Score: {conv}/100")
 
-        # FIX 2: Consolidation alert resets if market structure
-        # changes — so it can re-fire if setup resolves and returns
+        # Alert flag resets
         if state["consolidation_alert_sent"]:
             if gex_state != state.get("consolidation_gex_state"):
                 state["consolidation_alert_sent"] = False
-                print("Consolidation alert reset — GEX state changed")
 
-        # FIX 3: Hedge unwind alert allows re-firing every 45min
-        # if unwind score keeps growing — catches escalating flow
         now_epoch = time.time()
-        last_unwind_time = state.get("last_unwind_alert_time", 0)
-        if (state["hedge_unwind_alert_sent"] and
-                unwind_score >= 60 and
-                now_epoch - last_unwind_time > 2700):  # 45 min
+        if (state["hedge_unwind_alert_sent"] and unwind_score >= 60
+                and now_epoch - state.get("last_unwind_alert_time", 0) > 2700):
             state["hedge_unwind_alert_sent"] = False
-            print("Hedge unwind alert reset — score elevated, allowing re-fire")
 
-        # FIX 4: Mid-day GEX summary every 90 min
-        # Only fires when market is actually open
-        # Guards against pre-market false fires
-        last_summary_time = state.get("last_summary_time", 0)
-        market_is_open = is_market_open()
-        if (market_is_open and
-                6 <= h <= 12 and
-                now_epoch - last_summary_time > 5400):  # 90 min
+        # Mid-session update every 90 min
+        last_summary = state.get("last_summary_time", 0)
+        if (is_market_open() and 6 <= h <= 12
+                and now_epoch - last_summary > 5400):
             alert(
                 f"📊 MID-SESSION UPDATE — SPY\n"
                 f"{'─'*35}\n"
                 f"{now_str} PDT | ${price}\n\n"
-                f"GEX State: {gex_state}\n"
-                f"Regime: {regime}\n"
-                f"Ratio: {ratio_r}x\n"
-                f"OI: {oi_fmt} | VOL: {vol_fmt}\n\n"
+                f"GEX: {gex_state} | Regime: {regime}\n"
+                f"Ratio: {ratio_r}x | OI: {oi_fmt} | VOL: {vol_fmt}\n\n"
                 f"VIX: {vix_sig} | VVIX: {vvix_sig}\n"
-                f"Flow: {flow_dir}\n"
-                f"Unwind Score: {unwind_score}/100\n\n"
-                f"🎯 Conviction: {conv}/100 — {grade}\n"
-                f"→ {rec}"
+                f"Flow: {flow_dir} | Unwind: {unwind_score}/100\n\n"
+                f"🎯 {conv}/100 — {grade}\n→ {rec}"
             )
             state["last_summary_time"] = now_epoch
-            print(f"Mid-session update sent at {now_str} PDT")
 
-        # Reset daily flags + end of day auto-fill
-        if h >= 13:
-            # Guard: only run EOD once per day
-            if not state.get("eod_fired_today"):
-                eod_autofill(price)
-                state["eod_fired_today"] = True
+        # EOD — fires once at 1pm PDT
+        if h >= 13 and not state.get("eod_fired_today"):
+            eod_autofill(price)
+            state["eod_fired_today"] = True
+            # Reset daily intraday state
             state["velocity_score_sent"] = False
             state["consolidation_alert_sent"] = False
             state["hedge_unwind_alert_sent"] = False
@@ -2617,17 +2576,12 @@ def run_job():
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM /notes COMMAND
-# Only manual input needed — add context
-# to today's log rows via Telegram message
-# Usage: /notes Iran news drove the gap
+# TELEGRAM COMMANDS
+# /status — bot health check
+# /notes [text] — add context to today's log
+# /overnight — manual overnight snapshot
 # ─────────────────────────────────────────────
 async def handle_telegram_updates():
-    """
-    Polls Telegram for /notes and /status commands.
-    /notes [text] → saves note to today's CSV rows
-    /status → replies with bot health and today's data
-    """
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
         updates = await bot.get_updates(timeout=5)
@@ -2636,21 +2590,24 @@ async def handle_telegram_updates():
         for update in updates:
             if not update.message:
                 continue
-            text = update.message.text or ""
+            text = (update.message.text or "").strip()
 
-            # ── /status command ──
-            if text.strip() == "/status":
+            # ── /status ──
+            if text == "/status":
                 rows_today = 0
+                overnight_rows = 0
                 last_time = "none"
                 csv_exists = os.path.exists(LOG_FILE)
 
                 if csv_exists:
                     try:
                         with open(LOG_FILE, "r", newline="") as f:
-                            reader = csv.DictReader(f)
-                            all_rows = list(reader)
+                            all_rows = list(csv.DictReader(f))
                             today_rows = [r for r in all_rows if r.get("date") == today_str]
-                            rows_today = len(today_rows)
+                            rows_today = len([r for r in today_rows
+                                             if r.get("session_type") == "MARKET"])
+                            overnight_rows = len([r for r in today_rows
+                                                 if r.get("session_type") == "OVERNIGHT"])
                             if today_rows:
                                 last_time = today_rows[-1].get("time", "?")
                     except Exception:
@@ -2660,8 +2617,6 @@ async def handle_telegram_updates():
                 tg_ok = "✅" if TELEGRAM_TOKEN else "❌"
                 ai_ok = "✅" if anthropic_client else "❌"
                 gh_ok = "✅" if os.getenv("GITHUB_TOKEN") else "❌"
-                regime = state.get("regime", "unknown")
-                conv = state.get("last_conviction_score", 0)
                 now_str = now_pdt().strftime("%H:%M")
 
                 await bot.send_message(
@@ -2670,58 +2625,118 @@ async def handle_telegram_updates():
                         f"📊 BOT STATUS\n"
                         f"{'─'*30}\n"
                         f"Time: {now_str} PDT\n"
-                        f"Market open: {'YES' if is_market_open() else 'NO'}\n\n"
-                        f"📝 Today's data ({today_str}):\n"
-                        f"Rows logged: {rows_today}\n"
+                        f"Market open: {'YES' if is_market_open() else 'NO'}\n"
+                        f"Overnight window: {'YES' if is_overnight_window() else 'NO'}\n\n"
+                        f"📝 Today ({today_str}):\n"
+                        f"Market rows: {rows_today}\n"
+                        f"Overnight rows: {overnight_rows}\n"
                         f"Last reading: {last_time} PDT\n"
-                        f"CSV exists: {'YES ✅' if csv_exists else 'NO ❌'}\n\n"
-                        f"🔄 Current state:\n"
-                        f"Regime: {regime}\n"
-                        f"Score: {conv}/100\n\n"
+                        f"CSV: {'YES ✅' if csv_exists else 'NO ❌'}\n\n"
+                        f"🔄 State:\n"
+                        f"Regime: {state.get('regime', 'unknown')}\n"
+                        f"Score: {state.get('last_conviction_score', 0)}/100\n\n"
                         f"🔑 API keys:\n"
                         f"UW: {uw_ok} | Telegram: {tg_ok}\n"
-                        f"Claude: {ai_ok} | GitHub: {gh_ok}"
+                        f"Claude: {ai_ok} | GitHub: {gh_ok}\n\n"
+                        f"💡 GitHub ❌? Add GITHUB_TOKEN to Railway vars.\n"
+                        f"   Get at: github.com/settings/tokens"
                     )
                 )
-                print(f"Status sent at {now_str}")
                 continue
 
-            # ── /notes command ──
-            if not text.startswith("/notes "):
-                continue
-
-            note = text[7:].strip()
-            if not note:
-                continue
-
-            if not os.path.exists(LOG_FILE):
-                continue
-
-            rows = []
-            with open(LOG_FILE, "r", newline="") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-
-            updated = 0
-            for r in rows:
-                if r["date"] == today_str:
-                    r["notes"] = note
-                    updated += 1
-
-            with open(LOG_FILE, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
-                writer.writeheader()
-                writer.writerows(rows)
-
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=(
-                    f"✅ Note saved to {updated} rows\n"
-                    f"Date: {today_str}\n"
-                    f"Note: {note}"
+            # ── /overnight — manual snapshot ──
+            if text == "/overnight":
+                now_str = now_pdt().strftime("%H:%M")
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"🌙 Fetching overnight snapshot at {now_str} PDT..."
                 )
-            )
-            print(f"Note saved: {note}")
+                overnight = fetch_overnight_data()
+                written = write_overnight_alert_with_claude(overnight, "overnight_update")
+
+                futures_chg = overnight.get("futures_change_pct", 0) or 0
+                futures_dir = overnight.get("futures_direction", "FLAT")
+                vix_current = overnight.get("vix_current", "N/A")
+                vix_dir = overnight.get("vix_direction", "STABLE")
+                catalyst = overnight.get("catalyst_type", "NONE")
+
+                if written:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"🌙 OVERNIGHT SNAPSHOT — SPY\n"
+                            f"{'─'*35}\n"
+                            f"{now_str} PDT\n\n"
+                            f"ES Futures: {futures_dir} {futures_chg:+.2f}%\n"
+                            f"VIX: {vix_current} ({vix_dir})\n"
+                            f"Catalyst: {catalyst}\n\n"
+                            f"{written}"
+                        )
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"🌙 OVERNIGHT SNAPSHOT — SPY\n"
+                            f"{'─'*35}\n"
+                            f"{now_str} PDT\n\n"
+                            f"ES Futures: {futures_dir} {futures_chg:+.2f}%\n"
+                            f"VIX: {vix_current} ({vix_dir})\n"
+                            f"Catalyst: {catalyst}\n\n"
+                            f"Full update in next scheduled check."
+                        )
+                    )
+                log_overnight_reading(overnight)
+                continue
+
+            # ── /notes [text] ──
+            if text.startswith("/notes"):
+                note = text[6:].strip()
+
+                # Handle /notes sent without text
+                if not note:
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            "💬 Usage: /notes [your context]\n\n"
+                            "Examples:\n"
+                            "/notes Iran ceasefire drove rally\n"
+                            "/notes Fed pause rumor bearish\n"
+                            "/notes No catalyst today — structure only"
+                        )
+                    )
+                    continue
+
+                if not os.path.exists(LOG_FILE):
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text="⚠️ No log file found yet. Will be created at next market reading."
+                    )
+                    continue
+
+                rows = []
+                with open(LOG_FILE, "r", newline="") as f:
+                    rows = list(csv.DictReader(f))
+
+                updated = 0
+                for r in rows:
+                    if r["date"] == today_str:
+                        r["notes"] = note
+                        updated += 1
+
+                with open(LOG_FILE, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"✅ Note saved to {updated} rows\n"
+                        f"Date: {today_str}\n"
+                        f"Note: {note}"
+                    )
+                )
 
     except Exception as e:
         print(f"Telegram command error: {e}")
@@ -2732,45 +2747,54 @@ def check_telegram_commands():
 
 
 # ─────────────────────────────────────────────
-# SCHEDULE (original gamma bot times preserved)
+# MIDNIGHT RESET
 # ─────────────────────────────────────────────
 def midnight_reset():
-    """
-    Resets eod_fired_today at midnight PDT
-    so EOD can fire again the next trading day.
-    """
     pdt = now_pdt()
     if pdt.hour == 0:
         state["eod_fired_today"] = False
         print("🌙 Midnight reset — EOD flag cleared for new trading day")
 
 
-schedule.every().day.at("13:00").do(run_job)  # 6:00am PDT
-schedule.every().day.at("13:30").do(run_job)  # 6:30am PDT
-schedule.every().day.at("14:00").do(run_job)  # 7:00am PDT
-schedule.every().day.at("14:45").do(run_job)  # 7:45am PDT
-schedule.every().day.at("15:30").do(run_job)  # 8:30am PDT
-schedule.every().day.at("16:15").do(run_job)  # 9:15am PDT
-schedule.every().day.at("17:00").do(run_job)  # 10:00am PDT
-schedule.every().day.at("17:45").do(run_job)  # 10:45am PDT
-schedule.every().day.at("18:30").do(run_job)  # 11:30am PDT
-schedule.every().day.at("19:15").do(run_job)  # 12:15pm PDT
-schedule.every().day.at("20:00").do(run_job)  # 1:00pm PDT (EOD)
+# ─────────────────────────────────────────────
+# SCHEDULE
+# All times in UTC (PDT = UTC-7)
+# ─────────────────────────────────────────────
 
+# Daytime jobs (market hours)
+schedule.every().day.at("13:00").do(run_job)   # 6:00am PDT
+schedule.every().day.at("13:30").do(run_job)   # 6:30am PDT
+schedule.every().day.at("14:00").do(run_job)   # 7:00am PDT
+schedule.every().day.at("14:45").do(run_job)   # 7:45am PDT
+schedule.every().day.at("15:30").do(run_job)   # 8:30am PDT
+schedule.every().day.at("16:15").do(run_job)   # 9:15am PDT
+schedule.every().day.at("17:00").do(run_job)   # 10:00am PDT
+schedule.every().day.at("17:45").do(run_job)   # 10:45am PDT
+schedule.every().day.at("18:30").do(run_job)   # 11:30am PDT
+schedule.every().day.at("19:15").do(run_job)   # 12:15pm PDT
+schedule.every().day.at("20:00").do(run_job)   # 1:00pm PDT (EOD)
+
+# Every 5 min jobs (market hours only — guarded internally)
 schedule.every(5).minutes.do(check_vwap)
 schedule.every(5).minutes.do(check_consolidation_job)
 schedule.every(5).minutes.do(check_telegram_commands)
 schedule.every(5).minutes.do(check_doji_transition)
 schedule.every(5).minutes.do(check_gamma_wall_approach)
 schedule.every(5).minutes.do(midnight_reset)
+
+# Heartbeat — market hours (guarded internally)
 schedule.every(60).minutes.do(check_heartbeat)
 
-print("SPY UNIFIED BOT v4.1 — ML READY")
+# Overnight monitoring — runs every 30 min
+# The function itself checks if it's appropriate to alert
+schedule.every(30).minutes.do(run_overnight_check)
+
+print("SPY UNIFIED BOT v5.0 — ML READY + OVERNIGHT")
 print("=" * 60)
-print("Modules:")
-print("  1. GEX Core")
+print("Daytime Modules:")
+print("  1. GEX Core + State Change Alerts")
 print("  2. VWAP Cross Alerts")
-print("  3. Conviction Spike")
+print("  3. Conviction Spike Alerts")
 print("  4. Regime Detection Engine")
 print("  5. Hedge Unwind Detector")
 print("  6. Vanna / Charm Engine")
@@ -2779,14 +2803,31 @@ print("  8. VIX / VVIX + Momentum")
 print("  9. TICK + Inventory Precision")
 print(" 10. Calendar / Quarter System")
 print(" 11. Unified Conviction Scorer")
-print(" 12. ML Data Logger — FULLY AUTOMATED")
+print(" 12. Claude AI Verification + Alert Writer")
 print(" 13. Heartbeat Watchdog (60min)")
 print(" 14. Doji Transition Detector")
 print(" 15. Gamma Wall / TP Zone Alert")
+print(" 16. ML Data Logger — FULLY AUTOMATED")
+print("-" * 60)
+print("Overnight Modules (NEW):")
+print(" 17. ES Futures Tracker")
+print(" 18. VIX Overnight Change Monitor")
+print(" 19. Institutional News Catalyst Detector")
+print(" 20. Claude Overnight Alert Writer")
+print(" 21. Overnight CSV Logger (session_type=OVERNIGHT)")
+print(" 22. /overnight Telegram Command")
 print("=" * 60)
 print("Timezone: All times PDT (UTC-7)")
-print("Schedule: 6:00am - 1:00pm PDT")
+print("Schedule: Daytime 6:00am-1:00pm | Overnight: continuous")
+print("Telegram: /status /notes /overnight")
 print("=" * 60)
+print()
+print("⚠️  GitHub ❌ in /status?")
+print("   Add GITHUB_TOKEN to Railway environment variables.")
+print("   Get at: github.com/settings/tokens (repo scope only)")
+print("   Without this, CSV is wiped on every redeploy.")
+print("=" * 60)
+
 init_log()
 run_job()
 
