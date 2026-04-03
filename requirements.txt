@@ -4,4 +4,5 @@ python-telegram-bot
 python-dotenv
 yfinance
 numpy
-anthropic
+pandas
+anthropic# cache bust
