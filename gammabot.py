@@ -180,6 +180,8 @@ state = {
     "last_news_sentiment": "NEUTRAL",
     "last_catalyst_type": "NONE",
     "last_macro_override": "NO",
+    # Telegram deduplication — prevents re-processing old messages
+    "telegram_last_update_id": 0,
 }
 
 
@@ -3021,10 +3023,19 @@ def run_job():
 async def handle_telegram_updates():
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-        updates = await bot.get_updates(timeout=5)
+        # Use offset to only fetch NEW updates — never re-process old ones
+        # offset = last_update_id + 1 tells Telegram to discard everything before it
+        last_offset = state.get("telegram_last_update_id", 0)
+        offset = last_offset + 1 if last_offset > 0 else None
+
+        updates = await bot.get_updates(timeout=5, offset=offset)
         today_str = now_pdt().strftime("%Y-%m-%d")
 
         for update in updates:
+            # Track highest update_id seen — Telegram won't resend these
+            if update.update_id > state.get("telegram_last_update_id", 0):
+                state["telegram_last_update_id"] = update.update_id
+
             if not update.message:
                 continue
             text = (update.message.text or "").strip()
@@ -3280,7 +3291,15 @@ print("   IMPORTANT: Until this is set, months of data are at risk.")
 print("=" * 60)
 
 init_log()
-run_job()
+
+# Only run job immediately on startup if market is open or pre-market
+# Prevents EOD/alerts firing on every afternoon redeploy
+pdt_now = now_pdt()
+startup_hour = pdt_now.hour
+if 5 <= startup_hour <= 14:  # 5am-2pm PDT — pre-market through close
+    run_job()
+else:
+    print(f"Startup at {pdt_now.strftime('%H:%M')} PDT — outside market window, skipping initial run_job")
 
 while True:
     schedule.run_pending()
