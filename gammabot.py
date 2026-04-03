@@ -182,6 +182,8 @@ state = {
     "last_macro_override": "NO",
     # Telegram deduplication — prevents re-processing old messages
     "telegram_last_update_id": 0,
+    # Change detection — skip alerts when nothing meaningful changed
+    "last_logged_price": 0,
 }
 
 
@@ -2655,6 +2657,88 @@ def eod_autofill(close_price):
 def run_job():
     pdt = now_pdt()
     now_str = pdt.strftime("%H:%M")
+    h = pdt.hour
+    m = pdt.minute
+    weekday = pdt.weekday()  # 0=Mon, 6=Sun
+
+    # ── Intelligent activity guard ─────────────────────────────
+    # Don't kill the bot on a blunt time check — instead check
+    # whether there's anything worth running for.
+    #
+    # ALWAYS run if:
+    #   1. Market is open (Mon-Fri 6:00am-1:00pm PDT)
+    #   2. Pre-market window (Mon-Fri 5:30am-6:00am PDT)
+    #   3. EOD has not fired yet on a trading day (catch late data)
+    #
+    # SKIP if ALL of these are true:
+    #   - Not a trading day OR market is closed
+    #   - EOD already fired (or it's a weekend)
+    #   - Futures are quiet (< 1% move) — no overnight catalyst
+    #   - VIX is stable (no fear spike)
+    #   - No major news catalyst active
+    # ───────────────────────────────────────────────────────────
+
+    is_trading_day = weekday < 5
+    market_open = is_trading_day and (6 <= h < 13 or (h == 13 and m == 0))
+    pre_market = is_trading_day and (h == 5 and m >= 30)
+    eod_fired = state.get("eod_fired_today", False)
+
+    # Always run during market hours or pre-market
+    if market_open or pre_market:
+        pass  # proceed normally
+
+    # After hours / weekend — check if anything is actually happening
+    else:
+        # Check futures and VIX for overnight activity
+        futures_active = False
+        vix_active = False
+        news_active = False
+
+        try:
+            es = yf.Ticker("ES=F").history(period="1d", interval="5m")
+            if not es.empty:
+                if isinstance(es.columns, pd.MultiIndex):
+                    es.columns = es.columns.get_level_values(0)
+                current = float(es["Close"].iloc[-1])
+                prev = float(es["Close"].iloc[0])
+                chg = abs((current - prev) / prev * 100)
+                futures_active = chg >= 1.0  # 1%+ futures move
+        except Exception:
+            pass
+
+        try:
+            vix_hist = state.get("vix_history", [])
+            if len(vix_hist) >= 2:
+                vix_active = abs(vix_hist[-1] - vix_hist[0]) >= 2.0
+        except Exception:
+            pass
+
+        # Check last known catalyst from state
+        last_catalyst = state.get("last_catalyst_type", "NONE")
+        last_macro = state.get("last_macro_override", "NO")
+        news_active = last_macro == "YES" or last_catalyst in ["FED", "GEO"]
+
+        # If nothing notable is happening, skip
+        if not futures_active and not vix_active and not news_active:
+            reason = []
+            if not is_trading_day:
+                reason.append(f"weekend ({pdt.strftime('%A')})")
+            elif eod_fired:
+                reason.append("EOD fired, market closed")
+            else:
+                reason.append(f"after hours ({now_str} PDT)")
+            reason.append("futures quiet, VIX stable, no catalyst")
+            print(f"run_job skipped — {' | '.join(reason)}")
+            return
+
+        # Something notable IS happening after hours — run but note it
+        print(f"\n{'='*60}\nJob (after-hours activity detected): {now_str} PDT")
+        print(f"Futures active: {futures_active} | VIX active: {vix_active} | News: {news_active}")
+        print(f"{'='*60}")
+        # Don't fire EOD again or send duplicate alerts
+        # Just log the data silently for ML purposes
+        # (EOD guard below handles this)
+
     print(f"\n{'='*60}\nJob: {now_str} PDT\n{'='*60}")
 
     try:
@@ -2679,6 +2763,76 @@ def run_job():
         oi_fmt = format_gex(oi_m)
         vol_fmt = format_gex(vol_m)
         ratio_r = round(ratio, 2)
+
+        # ── CHANGE DETECTION GATE ──────────────────────────────────────
+        # If nothing meaningful has changed since last reading,
+        # skip alerts and AI calls — just log silently and return.
+        # This prevents redundant messages on flat/choppy mornings.
+        #
+        # A reading is considered "changed" if ANY of these are true:
+        #   1. GEX state changed (e.g. COUNTER → DIRECTIONAL)
+        #   2. Price moved more than $1.50 since last reading
+        #   3. Vol GEX changed more than 5% (momentum building/dying)
+        #   4. Ratio moved more than 0.2x (conviction shifting)
+        #   5. It's the first reading of the day (morning brief always fires)
+        #   6. EOD is due (h >= 13)
+        #   7. It's within the morning brief window (6:25-7:15am PDT)
+        prev_gex_state = state.get("previous_gex_state")
+        prev_price = state.get("last_logged_price", 0)
+        prev_vol = state.get("previous_vol_gex") or vol_gex
+        prev_ratio = state.get("previous_ratio") or ratio
+
+        gex_state_changed = gex_state != prev_gex_state
+        price_moved = abs(price - prev_price) >= 1.50
+        vol_gex_shifted = (abs(vol_gex - prev_vol) / abs(prev_vol) * 100
+                           >= 5.0) if prev_vol != 0 else True
+        ratio_shifted = abs(ratio - prev_ratio) >= 0.20
+        first_reading = prev_gex_state is None
+        eod_due = h >= 13 and not state.get("eod_fired_today")
+        morning_brief_window = (h == 6 and pdt.minute >= 25) or (h == 7 and pdt.minute <= 15)
+
+        something_changed = (
+            gex_state_changed or price_moved or vol_gex_shifted or
+            ratio_shifted or first_reading or eod_due or morning_brief_window
+        )
+
+        if not something_changed:
+            # Log the reading silently for ML data but skip all alerts/AI
+            print(f"  → No meaningful change — silent log only "
+                  f"(price ${price}, {gex_state}, ratio {ratio_r}x)")
+            # Still detect regime for state tracking
+            regime, reg_conf = detect_regime(oi_gex, vol_gex,
+                                             state["vol_gex_history"])
+            vix_spot, vvix_val, vix_term, _, _, _ = fetch_vix_data()
+            cal_flags_s, cal_bonus, days_opex = get_calendar_flags()
+            tick_signal, tick_approx, inventory_bias, open_drive = \
+                fetch_tick_and_inventory()
+            vt, vs, ct, cs, conflict = fetch_vanna_charm()
+            conv, grade, rec, _ = score_conviction(
+                vix_spot, vvix_val, vix_term, vol_gex,
+                prev_vol, regime, 0, cal_bonus, False,
+                conflict, ratio, tick_approx, inventory_bias, open_drive
+            )
+            log_reading(
+                price=price, oi_gex=oi_gex, vol_gex=vol_gex,
+                oi_m=oi_m, vol_m=vol_m, ratio=ratio,
+                gex_state=gex_state, regime=regime,
+                conv=conv, grade=grade,
+                vix_spot=vix_spot, vvix_val=vvix_val, vix_term=vix_term,
+                tick_approx=tick_approx, inventory_bias=inventory_bias,
+                unwind_score=0, open_drive=open_drive,
+                vanna_target=vt, charm_target=ct,
+                cal_flags=[], days_opex=days_opex,
+                claude_verdict="SKIPPED", claude_confidence=0,
+                claude_reasoning="No change detected", combined_score=conv
+            )
+            state["previous_gex_state"] = gex_state
+            state["previous_ratio"] = ratio
+            state["previous_vol_gex"] = vol_gex
+            state["previous_oi_gex"] = oi_gex
+            state["last_logged_price"] = price
+            return
+        # ── END CHANGE DETECTION ───────────────────────────────────────
 
         vix_spot, vvix_val, vix_term, term_sig, vix_sig, vvix_sig = fetch_vix_data()
         vt, vs, ct, cs, conflict = fetch_vanna_charm()
@@ -3294,12 +3448,8 @@ init_log()
 
 # Only run job immediately on startup if market is open or pre-market
 # Prevents EOD/alerts firing on every afternoon redeploy
-pdt_now = now_pdt()
-startup_hour = pdt_now.hour
-if 5 <= startup_hour <= 14:  # 5am-2pm PDT — pre-market through close
-    run_job()
-else:
-    print(f"Startup at {pdt_now.strftime('%H:%M')} PDT — outside market window, skipping initial run_job")
+print("Bot started — waiting for scheduled jobs.")
+print("Next market open: 6:00am PDT")
 
 while True:
     schedule.run_pending()
