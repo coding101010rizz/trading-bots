@@ -91,6 +91,8 @@ LOG_HEADERS = [
     "overnight_news_flag",       # MAJOR_EVENT / MINOR / NONE
     "gap_direction",             # UP / DOWN / NONE
     "gap_size",                  # points SPY gapped at open
+    "gap_type",                  # DIRECTIONAL/FADE_THEN_STATIC/FULL_FADE/GAP_AND_REVERSE/STATIC/UNKNOWN
+    "gap_conviction",            # 0-100 confidence in gap_type classification
     "vol_gex_velocity_alert",    # YES if velocity crossed threshold
     "outcome_direction", "outcome_points",
     "signal_correct", "max_move_up", "max_move_down",
@@ -183,6 +185,14 @@ state = {
     "prev_session_close": None,
     "gap_direction": "NONE",
     "gap_size": 0,
+    "gap_type": "UNKNOWN",
+    "gap_conviction": 0,
+    "gap_type_sent": False,       # prevent re-sending gap classification alert
+    # Dedup gate for log_reading
+    "last_logged_row": {},
+    # Vol GEX snapshots for gap classification
+    "open_vol_gex_snapshot": None,   # Vol GEX at market open (6:30am)
+    "overnight_vol_gex_close": None, # Vol GEX at yesterday's close (set at EOD)
     # Vol GEX velocity alert
     "vol_gex_velocity_alert_sent": False,
     "last_vol_gex_velocity": 0,
@@ -963,13 +973,427 @@ def fetch_futures_direction():
         return "FLAT", 0.0, None
 
 # ─────────────────────────────────────────────
-# MODULE 12: GAP FILL DETECTOR
+# MODULE 12: GAP CLASSIFICATION ENGINE
 # ─────────────────────────────────────────────
+# Gap types (what you will actually see in the market):
+#
+# DIRECTIONAL (gap and go):
+#   Market gaps, holds above/below open, trends all day.
+#   Institutions agree with the gap direction.
+#   Entry: calls/puts at open, hold through day.
+#
+# FADE_THEN_STATIC (gap up/down, fade to VWAP, then chop):
+#   Most common type. Market gaps, reverses to VWAP,
+#   then oscillates near VWAP rest of day.
+#   Entry: fade the gap direction back to VWAP,
+#   then no trade — chop kills premium.
+#
+# FULL_FADE (gap fully fills to prev close):
+#   Gap opens, entire move reverses back to prev session close.
+#   Institutions used the gap to exit positions.
+#   Entry: aggressive fade, hold to prev close target.
+#
+# GAP_AND_REVERSE (gap one direction, full reversal other way):
+#   Rarest. Gap up $5, then falls $8 below prev close.
+#   Usually a macro shock or surprise news.
+#   Entry: wait for first 15min then trade the reversal.
+#
+# STATIC (tiny gap, market pins near open all day):
+#   Gap < $1.50, no meaningful overnight catalyst.
+#   Vol GEX flat, no conviction either way.
+#   Entry: no trade — theta decays premium fast.
+# ─────────────────────────────────────────────
+
+def classify_gap(vol_gex, vix_change, news_sentiment,
+                 macro_override, catalyst_type, catalyst_strength,
+                 futures_chg):
+    """
+    Classifies the overnight gap at market open using
+    all available signals. Returns (gap_type, conviction, explanation).
+
+    Called once per session at 6:30am PDT open.
+    Stored in state and logged to CSV every row.
+    """
+    gap_size  = state.get("gap_size", 0)
+    gap_dir   = state.get("gap_direction", "NONE")
+    open_vgex = state.get("open_vol_gex_snapshot")  # Vol GEX at open
+    prev_vgex = state.get("overnight_vol_gex_close") # Vol GEX at yesterday close
+
+    if gap_dir == "NONE" or gap_size < 0.75:
+        state["gap_type"]      = "STATIC"
+        state["gap_conviction"] = 85
+        return "STATIC", 85, (
+            "Gap < $0.75 — no meaningful overnight move.\n"
+            "Market likely pins near open. "
+            "Theta decays premium fast in this environment.\n"
+            "→ No gap trade. Wait for GEX regime signal."
+        )
+
+    hold_score = 0
+    fade_score = 0
+    signals_hold = []
+    signals_fade = []
+
+    # ── SIGNAL 1: Vol GEX direction vs gap direction ──
+    # This is the single most important signal.
+    # If institutions are buying puts (negative Vol GEX)
+    # while futures are positive — they don't believe the gap.
+    if open_vgex is not None:
+        vgex_b = round(open_vgex / 1e9, 2)
+        if gap_dir == "UP":
+            if open_vgex < -5e9:
+                fade_score += 35
+                signals_fade.append(
+                    f"Vol GEX deeply negative ({vgex_b}B) despite gap UP "
+                    f"— institutions still holding put protection, "
+                    f"don't believe the move"
+                )
+            elif open_vgex < 0:
+                fade_score += 20
+                signals_fade.append(
+                    f"Vol GEX still negative ({vgex_b}B) vs gap UP "
+                    f"— mild bearish disagreement"
+                )
+            else:
+                hold_score += 30
+                signals_hold.append(
+                    f"Vol GEX positive ({vgex_b}B) matches gap UP "
+                    f"— institutions agreeing with move"
+                )
+        elif gap_dir == "DOWN":
+            if open_vgex > 5e9:
+                fade_score += 35
+                signals_fade.append(
+                    f"Vol GEX strongly positive ({vgex_b}B) despite gap DOWN "
+                    f"— put buying stopped, institutions not believing bear move"
+                )
+            elif open_vgex > 0:
+                fade_score += 20
+                signals_fade.append(
+                    f"Vol GEX positive ({vgex_b}B) vs gap DOWN "
+                    f"— mild bullish disagreement with gap"
+                )
+            else:
+                hold_score += 30
+                signals_hold.append(
+                    f"Vol GEX negative ({vgex_b}B) matches gap DOWN "
+                    f"— institutions agreeing with bearish move"
+                )
+
+    # ── SIGNAL 2: Vol GEX improvement overnight ──
+    # If Vol GEX improved overnight (less negative or flipped positive)
+    # alongside a gap up — two forces aligning = strong hold signal.
+    if open_vgex is not None and prev_vgex is not None:
+        overnight_change = open_vgex - prev_vgex
+        if gap_dir == "UP" and overnight_change > 2e9:
+            hold_score += 20
+            signals_hold.append(
+                f"Vol GEX improved +${round(overnight_change/1e9,1)}B overnight "
+                f"alongside gap UP — institutional put closing confirms gap"
+            )
+        elif gap_dir == "DOWN" and overnight_change < -2e9:
+            hold_score += 20
+            signals_hold.append(
+                f"Vol GEX worsened ${round(overnight_change/1e9,1)}B overnight "
+                f"alongside gap DOWN — institutional put buying confirms gap"
+            )
+        elif gap_dir == "UP" and overnight_change < -2e9:
+            fade_score += 15
+            signals_fade.append(
+                f"Vol GEX worsened ${round(overnight_change/1e9,1)}B overnight "
+                f"despite gap UP — smart money adding puts into strength"
+            )
+
+    # ── SIGNAL 3: VIX behavior overnight ──
+    # Fear leaving = institutions comfortable = gap holds
+    # Fear building = someone knows something = gap may fade or reverse
+    if vix_change is not None:
+        if gap_dir == "UP":
+            if vix_change < -1.5:
+                hold_score += 20
+                signals_hold.append(
+                    f"VIX fell {abs(vix_change):.1f}pts overnight — "
+                    f"fear leaving as market gaps up = real conviction"
+                )
+            elif vix_change > 1.5:
+                fade_score += 20
+                signals_fade.append(
+                    f"VIX RISING +{vix_change:.1f}pts despite gap UP — "
+                    f"someone is buying protection into strength = trap signal"
+                )
+            else:
+                fade_score += 5
+                signals_fade.append(
+                    f"VIX flat overnight ({vix_change:+.1f}pts) — "
+                    f"no fear compression to fuel gap continuation"
+                )
+        elif gap_dir == "DOWN":
+            if vix_change > 2.0:
+                hold_score += 20
+                signals_hold.append(
+                    f"VIX spiked +{vix_change:.1f}pts with gap DOWN — "
+                    f"real fear building, institutions hedging hard"
+                )
+            elif vix_change < -1.5:
+                fade_score += 20
+                signals_fade.append(
+                    f"VIX FALLING despite gap DOWN — "
+                    f"fear leaving as price drops = no real conviction in bear move"
+                )
+
+    # ── SIGNAL 4: News / macro override ──
+    if macro_override == "YES":
+        if catalyst_strength >= 70:
+            if (gap_dir == "UP" and news_sentiment == "BULLISH") or \
+               (gap_dir == "DOWN" and news_sentiment == "BEARISH"):
+                hold_score += 15
+                signals_hold.append(
+                    f"Macro catalyst ({catalyst_type} strength {catalyst_strength}) "
+                    f"aligns with gap direction — fundamental driver present"
+                )
+            else:
+                fade_score += 20
+                signals_fade.append(
+                    f"Macro override YES but sentiment contradicts gap — "
+                    f"news-driven gaps with conflicting signals fade hard"
+                )
+        else:
+            fade_score += 10
+            signals_fade.append(
+                f"Macro override active ({catalyst_type}) — "
+                f"macro gaps fade more often than technical gaps"
+            )
+
+    # ── SIGNAL 5: Gap size vs conviction ──
+    # Large gaps (>$5) are harder to hold than small gaps ($1-3)
+    if gap_size >= 8:
+        fade_score += 20
+        signals_fade.append(
+            f"Large gap ${gap_size:.2f} — gaps >$8 fill completely "
+            f"within same session 70%+ of the time"
+        )
+    elif gap_size >= 5:
+        fade_score += 10
+        signals_fade.append(
+            f"Gap ${gap_size:.2f} — medium gap, fade to at least "
+            f"VWAP expected before any continuation"
+        )
+    elif gap_size >= 2:
+        hold_score += 5
+        signals_hold.append(
+            f"Gap ${gap_size:.2f} — small gap, easier to hold "
+            f"with institutional backing"
+        )
+
+    # ── SIGNAL 6: Futures magnitude ──
+    abs_fut = abs(futures_chg) if futures_chg else 0
+    if abs_fut >= 1.5:
+        fade_score += 10
+        signals_fade.append(
+            f"Futures moved {abs_fut:.1f}% overnight — "
+            f"large futures moves mean early birds already positioned, "
+            f"latecomers fade the open"
+        )
+
+    # ── CLASSIFY ──
+    total = hold_score + fade_score
+    if total == 0:
+        state["gap_type"]       = "UNKNOWN"
+        state["gap_conviction"] = 40
+        return "UNKNOWN", 40, "Insufficient data to classify gap."
+
+    hold_pct = hold_score / total
+    conviction = min(95, int(max(hold_score, fade_score) / total * 100))
+
+    hold_lines = "\n  → ".join(signals_hold) if signals_hold else "None"
+    fade_lines = "\n  → ".join(signals_fade) if signals_fade else "None"
+
+    # ── Determine type based on scores + magnitude ──
+    if hold_pct >= 0.65:
+        gap_type = "DIRECTIONAL"
+        state["gap_type"]       = gap_type
+        state["gap_conviction"] = conviction
+        return gap_type, conviction, (
+            f"HOLD signals ({hold_score}pts):\n  → {hold_lines}\n\n"
+            f"FADE signals ({fade_score}pts):\n  → {fade_lines}"
+        )
+    elif hold_pct <= 0.35 and gap_size >= 5:
+        gap_type = "FULL_FADE"
+        state["gap_type"]       = gap_type
+        state["gap_conviction"] = conviction
+        return gap_type, conviction, (
+            f"FADE signals ({fade_score}pts):\n  → {fade_lines}\n\n"
+            f"HOLD signals ({hold_score}pts):\n  → {hold_lines}"
+        )
+    elif hold_pct <= 0.35:
+        gap_type = "FADE_THEN_STATIC"
+        state["gap_type"]       = gap_type
+        state["gap_conviction"] = conviction
+        return gap_type, conviction, (
+            f"FADE signals ({fade_score}pts):\n  → {fade_lines}\n\n"
+            f"HOLD signals ({hold_score}pts):\n  → {hold_lines}"
+        )
+    else:
+        # Ambiguous — slight lean either way
+        if hold_score >= fade_score:
+            gap_type = "DIRECTIONAL"
+        else:
+            gap_type = "FADE_THEN_STATIC"
+        conviction = max(35, conviction - 20)  # lower conviction when ambiguous
+        state["gap_type"]       = gap_type
+        state["gap_conviction"] = conviction
+        return gap_type, conviction, (
+            f"AMBIGUOUS (leaning {gap_type})\n"
+            f"HOLD signals ({hold_score}pts):\n  → {hold_lines}\n\n"
+            f"FADE signals ({fade_score}pts):\n  → {fade_lines}"
+        )
+
+
+def build_gap_alert(gap_type, conviction, detail, vol_gex, vix_change,
+                    news_sentiment, catalyst_type):
+    """
+    Writes the plain English gap classification alert
+    that fires at 6:30am when market opens.
+    """
+    gap_dir  = state.get("gap_direction", "NONE")
+    gap_size = state.get("gap_size", 0)
+    open_px  = state.get("open_price")
+    prev_cl  = state.get("prev_session_close")
+    now_str  = now_pdt().strftime("%H:%M")
+
+    dir_word  = "UP" if gap_dir == "UP" else "DOWN"
+    dir_emoji = "🟢" if gap_dir == "UP" else "🔴"
+
+    # Type-specific plain English explanation
+    type_blocks = {
+
+        "DIRECTIONAL": (
+            f"🚀 GAP {dir_word} — DIRECTIONAL SETUP\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: {dir_emoji} ${gap_size:.2f} "
+            f"(open ${open_px} vs prev close ${prev_cl})\n"
+            f"Conviction: {conviction}%\n\n"
+            f"What this means:\n"
+            f"The gap is backed by real institutional agreement.\n"
+            f"When you see a DIRECTIONAL gap, institutions are\n"
+            f"positioning the same way the gap is moving.\n"
+            f"They are NOT going to fade it — they're adding.\n\n"
+            f"What to watch at open:\n"
+            f"→ First 3-5 candles stay {'above' if gap_dir=='UP' else 'below'} VWAP\n"
+            f"→ Volume above average on first candle\n"
+            f"→ No immediate rejection back through open price\n\n"
+            f"Trade:\n"
+            f"{'→ CALLS. Enter on VWAP hold after first 5min.' if gap_dir=='UP' else '→ PUTS. Enter on VWAP rejection after first 5min.'}\n"
+            f"Target: vanna level (check morning brief).\n"
+            f"Stop: close back through open price.\n\n"
+            f"Risk: If price immediately reverses below open\n"
+            f"in the first candle — this is a trap. Exit fast."
+        ),
+
+        "FADE_THEN_STATIC": (
+            f"↩️ GAP {dir_word} — FADE THEN CHOP SETUP\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: {dir_emoji} ${gap_size:.2f} "
+            f"(open ${open_px} vs prev close ${prev_cl})\n"
+            f"Conviction: {conviction}%\n\n"
+            f"What this means:\n"
+            f"The gap opens {'up' if gap_dir=='UP' else 'down'} but institutions\n"
+            f"{'are still holding puts — they don' + chr(39) + 't believe the bull move.' if gap_dir=='UP' else 'stopped adding puts — they don' + chr(39) + 't believe the bear move.'}\n"
+            f"Price will likely reverse back toward VWAP within\n"
+            f"the first 15-30 minutes, then chop near VWAP\n"
+            f"for the rest of the day.\n\n"
+            f"What to watch at open:\n"
+            f"→ Price fails to hold {'above' if gap_dir=='UP' else 'below'} VWAP within 5-15min\n"
+            f"→ Volume thins out after open spike\n"
+            f"→ First candle shows reversal wick\n\n"
+            f"Trade:\n"
+            f"{'→ PUTS on VWAP cross. Target: VWAP. Exit there — do not hold expecting full fill.' if gap_dir=='UP' else '→ CALLS on VWAP cross. Target: VWAP. Exit there — do not hold expecting full fill.'}\n"
+            f"After reaching VWAP: NO new trades.\n"
+            f"Market pins here rest of day — theta destroys premium.\n\n"
+            f"Target: ${prev_cl} (prev close / VWAP zone)\n"
+            f"Stop: price holds {'above' if gap_dir=='UP' else 'below'} VWAP for 2+ candles."
+        ),
+
+        "FULL_FADE": (
+            f"🔄 GAP {dir_word} — FULL FADE SETUP\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: {dir_emoji} ${gap_size:.2f} "
+            f"(open ${open_px} vs prev close ${prev_cl})\n"
+            f"Conviction: {conviction}%\n\n"
+            f"What this means:\n"
+            f"The gap opens {'up' if gap_dir=='UP' else 'down'} but every signal\n"
+            f"says institutions are fading this move hard.\n"
+            f"Price is expected to retrace the ENTIRE gap\n"
+            f"back to yesterday's close (${prev_cl}) within the session.\n\n"
+            f"Why this happens:\n"
+            f"Institutions used the gap to EXIT positions.\n"
+            f"{'Gap up = they sold into strength. Once they' + chr(39) + 're out, price collapses.' if gap_dir=='UP' else 'Gap down = they bought into weakness. Once they' + chr(39) + 're in, price recovers.'}\n\n"
+            f"What to watch at open:\n"
+            f"→ Price immediately {'sells below' if gap_dir=='UP' else 'pops above'} VWAP within 5min\n"
+            f"→ Strong volume on reversal candles\n"
+            f"→ Vol GEX accelerating {'negative' if gap_dir=='UP' else 'positive'}\n\n"
+            f"Trade:\n"
+            f"{'→ PUTS aggressively. Enter on any 5min candle that closes below VWAP.' if gap_dir=='UP' else '→ CALLS aggressively. Enter on any 5min candle that closes above VWAP.'}\n"
+            f"Target: ${prev_cl:.2f} (full gap fill)\n"
+            f"Stop: holds {'above' if gap_dir=='UP' else 'below'} open price ${open_px} for 15min.\n\n"
+            f"⚡ High conviction fade. Size up on confirmation."
+        ),
+
+        "GAP_AND_REVERSE": (
+            f"⚡ GAP {dir_word} — REVERSAL SETUP (RARE)\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: {dir_emoji} ${gap_size:.2f} "
+            f"(open ${open_px} vs prev close ${prev_cl})\n"
+            f"Conviction: {conviction}%\n\n"
+            f"What this means:\n"
+            f"Gap opens {'up' if gap_dir=='UP' else 'down'} but signals are so\n"
+            f"overwhelmingly against the gap that price is expected\n"
+            f"to not just fill the gap but CONTINUE PAST prev close.\n"
+            f"This is the rarest gap type — usually triggered by\n"
+            f"a macro shock or surprise institutional positioning.\n\n"
+            f"Wait for:\n"
+            f"→ First 15 minutes to confirm direction\n"
+            f"→ Vol GEX confirming {'negative' if gap_dir=='UP' else 'positive'}\n"
+            f"→ Price through prev close ${prev_cl:.2f}\n\n"
+            f"⚠️ Do NOT rush entry. Wait for 15min confirmation.\n"
+            f"This setup can also trap both sides — patience required."
+        ),
+
+        "STATIC": (
+            f"⚪ STATIC OPEN — NO GAP TRADE\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: ${gap_size:.2f} (minimal)\n\n"
+            f"What this means:\n"
+            f"No meaningful overnight gap. Market opens near\n"
+            f"yesterday's close. No institutional repositioning\n"
+            f"overnight. Price will likely oscillate near open.\n\n"
+            f"→ Skip the gap trade entirely.\n"
+            f"Wait for the 7:45-8:30am GEX regime signal\n"
+            f"to tell you if a directional trade sets up."
+        ),
+
+        "UNKNOWN": (
+            f"❓ GAP {dir_word} — INSUFFICIENT DATA\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | Gap: {dir_emoji} ${gap_size:.2f}\n\n"
+            f"Cannot classify gap — Vol GEX open data unavailable.\n"
+            f"→ Treat as FADE_THEN_STATIC until more data arrives.\n"
+            f"Check the 7:00am GEX reading for confirmation."
+        ),
+    }
+
+    base = type_blocks.get(gap_type, type_blocks["UNKNOWN"])
+    footer = (f"\n\n📊 WHY THIS CLASSIFICATION:\n{detail[:600]}"
+              if detail and gap_type not in ("STATIC", "UNKNOWN") else "")
+    return base + footer
+
+
 def check_gap_fill(current_price):
     """
-    Detects if today's gap is at risk of filling.
-    Gaps fill ~65% of the time intraday.
-    Returns: gap_fill_alert (bool), message
+    During the session, monitors whether gap is filling.
+    Fires a simple progress alert when price is within
+    50% of completing the gap fill.
+    Separate from classify_gap which runs once at open.
     """
     try:
         prev_close = state.get("prev_session_close")
@@ -980,26 +1404,25 @@ def check_gap_fill(current_price):
         if abs(gap) < 1.0:
             return False, ""
         gap_dir = "UP" if gap > 0 else "DOWN"
-        fill_target = prev_close
-        dist_to_fill = abs(current_price - fill_target)
-        # Alert when price is within 50% of filling the gap
+        dist_to_fill = abs(current_price - prev_close)
         half_gap = abs(gap) * 0.5
         if dist_to_fill <= half_gap:
+            gap_type = state.get("gap_type", "UNKNOWN")
             if gap_dir == "UP" and current_price < open_price:
                 return True, (
-                    f"📉 GAP FILL ALERT\n"
-                    f"Gapped UP ${abs(gap):.2f} at open (${open_price})\n"
-                    f"Price falling toward fill target: ${fill_target:.2f}\n"
-                    f"${dist_to_fill:.2f} away — 65% historical fill rate\n"
-                    f"→ Watch for support at ${fill_target:.2f}"
+                    f"📉 GAP FILL IN PROGRESS — SPY\n"
+                    f"Gap {gap_dir} ${abs(gap):.2f} | Type: {gap_type}\n"
+                    f"Price ${current_price:.2f} heading toward fill target ${prev_close:.2f}\n"
+                    f"${dist_to_fill:.2f} remaining\n"
+                    f"→ {'On track per classification' if gap_type in ('FULL_FADE','FADE_THEN_STATIC') else 'Unexpected reversal — reassess'}"
                 )
             elif gap_dir == "DOWN" and current_price > open_price:
                 return True, (
-                    f"📈 GAP FILL ALERT\n"
-                    f"Gapped DOWN ${abs(gap):.2f} at open (${open_price})\n"
-                    f"Price rising toward fill target: ${fill_target:.2f}\n"
-                    f"${dist_to_fill:.2f} away — 65% historical fill rate\n"
-                    f"→ Watch for resistance at ${fill_target:.2f}"
+                    f"📈 GAP FILL IN PROGRESS — SPY\n"
+                    f"Gap {gap_dir} ${abs(gap):.2f} | Type: {gap_type}\n"
+                    f"Price ${current_price:.2f} heading toward fill target ${prev_close:.2f}\n"
+                    f"${dist_to_fill:.2f} remaining\n"
+                    f"→ {'On track per classification' if gap_type in ('FULL_FADE','FADE_THEN_STATIC') else 'Unexpected reversal — reassess'}"
                 )
         return False, ""
     except Exception as e:
@@ -1425,6 +1848,23 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
                 claude_reasoning="", combined_score=0):
     try:
         now = now_pdt()
+
+        # ── DEDUP GATE ────────────────────────────────────────────────
+        # Prevents duplicate rows when 5-min jobs (check_telegram_commands,
+        # check_vwap, etc.) trigger log_reading between scheduled run_job calls.
+        # Skips write if all 5 key fields are identical to the last logged row.
+        current_minute = now.strftime("%H:%M")
+        last = state.get("last_logged_row", {})
+        if last:
+            if (last.get("time")             == current_minute and
+                    last.get("gex_state")    == gex_state and
+                    last.get("regime")       == regime and
+                    abs(float(last.get("price", 0)) - price) < 0.10 and
+                    last.get("conviction_score") == str(conv)):
+                print(f"⏭  Dedup skip: {current_minute} | {gex_state} | ${round(price,2)}")
+                return
+        # ─────────────────────────────────────────────────────────────
+
         # FIX: fetch news HERE so both log and AI verification use same data
         news_sentiment, news_score, catalyst_type, catalyst_strength, macro_override = \
             fetch_news_sentiment()
@@ -1442,7 +1882,7 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
                        .replace("⚠️","").replace("🔴","").replace("❌","").strip())
         row = {
             "date": now.strftime("%Y-%m-%d"),
-            "time": now.strftime("%H:%M"),
+            "time": current_minute,
             "price": round(price, 2),
             "oi_gex_raw": round(oi_gex / 1e9, 4),
             "vol_gex_raw": round(vol_gex / 1e9, 4),
@@ -1486,6 +1926,8 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "overnight_news_flag": "",
             "gap_direction": state.get("gap_direction", ""),
             "gap_size": state.get("gap_size", ""),
+            "gap_type": state.get("gap_type", "UNKNOWN"),
+            "gap_conviction": state.get("gap_conviction", 0),
             "vol_gex_velocity_alert": "YES" if state.get("vol_gex_velocity_alert_sent") else "NO",
             "outcome_direction": "",
             "outcome_points": "",
@@ -1500,7 +1942,17 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
         }
         with open(LOG_FILE, "a", newline="") as f:
             csv.DictWriter(f, fieldnames=LOG_HEADERS).writerow(row)
-        print(f"📝 Logged: {row['time']} | {gex_state} | Score:{conv} | "
+
+        # Update dedup tracker
+        state["last_logged_row"] = {
+            "time":             current_minute,
+            "gex_state":        gex_state,
+            "regime":           regime,
+            "price":            str(round(price, 2)),
+            "conviction_score": str(conv),
+        }
+
+        print(f"📝 Logged: {current_minute} | {gex_state} | Score:{conv} | "
               f"News:{news_sentiment} | {catalyst_type} | Override:{macro_override}")
         git_commit_log(reason="reading")
     except Exception as e:
@@ -1641,6 +2093,7 @@ def eod_autofill(close_price):
         state["overnight_vix_close"]  = state["vix_history"][-1] if state["vix_history"] else None
         state["overnight_gex_snapshot"]= {"oi": state.get("previous_oi_gex"),
                                            "vol": state.get("previous_vol_gex")}
+        state["overnight_vol_gex_close"] = state.get("previous_vol_gex")
         git_commit_log(reason="eod")
         now_str = now_pdt().strftime("%H:%M")
         sig_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
@@ -1908,18 +2361,50 @@ def run_job():
         print(f"${price} | {gex_state} | {regime} | Score:{conv} | Phase:{cycle_phase}")
         # Vol GEX velocity check (dedicated alert)
         check_vol_gex_velocity(vol_gex)
+
+        # ── NEWS FETCH — must run before gap classification AND AI verify ──
+        # Gap classification needs news_sentiment, catalyst_type, macro_override.
+        # AI verification needs the same. Fetch once here, reuse everywhere.
+        news_sent, news_score, cat_type, cat_strength, mac_ovr = fetch_news_sentiment()
+        state["last_news_sentiment"] = news_sent
+        state["last_catalyst_type"]  = cat_type
+        state["last_macro_override"] = mac_ovr
+
+        # ── GAP CLASSIFICATION — fires once at 6:30am open ──────────
+        # Snapshot Vol GEX at open for gap classification signal 1
+        if h == 6 and 29 <= m <= 35 and state.get("open_vol_gex_snapshot") is None:
+            state["open_vol_gex_snapshot"] = vol_gex
+            print(f"📸 Vol GEX open snapshot: {round(vol_gex/1e9,2)}B")
+
+        if (h == 6 and 29 <= m <= 45 and
+                state.get("gap_direction", "NONE") != "NONE" and
+                not state.get("gap_type_sent")):
+            vix_chg = None
+            if state.get("overnight_vix_close") and len(state.get("vix_history", [])) > 0:
+                vix_chg = round(state["vix_history"][-1] - state["overnight_vix_close"], 2)
+            g_type, g_conv, g_detail = classify_gap(
+                vol_gex=vol_gex,
+                vix_change=vix_chg,
+                news_sentiment=news_sent,
+                macro_override=mac_ovr,
+                catalyst_type=cat_type,
+                catalyst_strength=cat_strength,
+                futures_chg=state.get("gap_size", 0) * (1 if state.get("gap_direction") == "UP" else -1),
+            )
+            gap_alert_text = build_gap_alert(
+                g_type, g_conv, g_detail,
+                vol_gex, vix_chg, news_sent, cat_type
+            )
+            alert(gap_alert_text)
+            state["gap_type_sent"] = True
+            print(f"🔲 Gap classified: {g_type} ({g_conv}%)")
+        # ────────────────────────────────────────────────────────────
         # Gap fill check
         if is_market_open():
             gap_fill, gap_msg = check_gap_fill(price)
             if gap_fill and not state.get("gap_fill_alert_sent"):
                 alert(gap_msg)
                 state["gap_fill_alert_sent"] = True
-        # FIX: fetch news BEFORE AI verification so Claude gets current values
-        # (log_reading also fetches but AI verify runs before log_reading is called)
-        news_sent, news_score, cat_type, cat_str, mac_ovr = fetch_news_sentiment()
-        state["last_news_sentiment"] = news_sent
-        state["last_catalyst_type"]  = cat_type
-        state["last_macro_override"] = mac_ovr
         # AI verification
         should_verify = (
             conv >= 50 or
@@ -2121,13 +2606,13 @@ def run_job():
             for k in ["velocity_score_sent","consolidation_alert_sent",
                       "hedge_unwind_alert_sent","open_drive_detected",
                       "doji_transition_sent","vol_gex_velocity_alert_sent",
-                      "gap_fill_alert_sent"]:
+                      "gap_fill_alert_sent","gap_type_sent"]:
                 state[k] = False
             for k in ["last_unwind_alert_time","last_summary_time",
                       "last_heartbeat","last_wall_alert_price","gap_size"]:
                 state[k] = 0
             for k in ["consolidation_gex_state","open_price","open_iv","open_volume",
-                      "session_vwap","gap_direction"]:
+                      "session_vwap","gap_direction","open_vol_gex_snapshot"]:
                 state[k] = None
             for k in ["open_time_prices","tick_history"]:
                 state[k] = []
@@ -2135,6 +2620,9 @@ def run_job():
                 state[k] = None
             for k in ["regime_transitions_today","vwap_breaks_today"]:
                 state[k] = 0
+            state["last_logged_row"] = {}
+            state["gap_type"]        = "UNKNOWN"
+            state["gap_conviction"]  = 0
         # Update state
         state["previous_gex_state"] = gex_state
         state["previous_ratio"]     = ratio
@@ -2262,6 +2750,11 @@ def midnight_reset():
         state["overnight_alerts_today"] = 0
         state["overnight_report_sent"]  = False
         state["last_overnight_check"]   = 0
+        state["last_logged_row"]        = {}
+        state["gap_type_sent"]          = False
+        state["gap_type"]               = "UNKNOWN"
+        state["gap_conviction"]         = 0
+        state["open_vol_gex_snapshot"]  = None
         print("🌙 Midnight reset — daily flags cleared")
 
 # ─────────────────────────────────────────────
