@@ -27,6 +27,28 @@ GITHUB_TOKEN     = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO      = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
 TICKER           = "SPY"
 
+# ─────────────────────────────────────────────
+# MULTI-TICKER CONFIG
+# Option C architecture: secondary tickers only
+# suggested when SPY grade is D or F.
+# Bot ranks all tickers and picks the best one.
+#
+# IV_TICKER: volatility index per ticker
+#   SPY  → ^VIX  (CBOE VIX)
+#   QQQ  → ^VXN  (Nasdaq VIX)
+#   TSLA → None  (use IV rank from UW API)
+#   NVDA → None  (use IV rank from UW API)
+#   GOOGL→ None  (use IV rank from UW API)
+# ─────────────────────────────────────────────
+SECONDARY_TICKERS = {
+    "QQQ":   {"iv_ticker": "^VXN",  "name": "QQQ",   "vol_history_key": "qqq_vol_gex_history"},
+    "TSLA":  {"iv_ticker": None,    "name": "TSLA",  "vol_history_key": "tsla_vol_gex_history"},
+    "NVDA":  {"iv_ticker": None,    "name": "NVDA",  "vol_history_key": "nvda_vol_gex_history"},
+    "GOOGL": {"iv_ticker": None,    "name": "GOOGL", "vol_history_key": "googl_vol_gex_history"},
+}
+SPY_WEAK_GRADES = ("D", "F")   # grades that trigger multi-ticker check
+MAX_DAY_TRADES  = 3             # PDT limit — adjust if account > $25k
+
 # Anthropic client — AI verification + alert writing
 anthropic_client = (
     anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -98,6 +120,14 @@ LOG_HEADERS = [
     "signal_correct", "max_move_up", "max_move_down",
     "claude_verdict", "claude_confidence",
     "claude_reasoning", "combined_score",
+    # Open candle analysis — populated on 6:35am row only, blank all others
+    "open_candle_type",        # STRONG_BEAR/STRONG_BULL/REJECTION_WICK_TOP/REJECTION_WICK_BOTTOM/MODERATE_BEAR/MODERATE_BULL/DOJI/UNCLEAR
+    "open_candle_body_pct",    # body as % of full candle range
+    "open_candle_upper_wick",  # upper wick as % of range
+    "open_candle_lower_wick",  # lower wick as % of range
+    "open_candle_vol_ratio",   # volume vs 10-candle average (e.g. 2.3 = 2.3x)
+    "open_candle_vwap_pos",    # ABOVE / BELOW / AT
+    "open_candle_confluence",  # CONFIRMED / CONFLICT / WAIT / NEUTRAL
     "notes"
 ]
 
@@ -198,6 +228,50 @@ state = {
     "last_vol_gex_velocity": 0,
     # Gap fill alert
     "gap_fill_alert_sent": False,
+    # Open candle analysis
+    "open_candle_analyzed":    False,
+    "open_candle_type":        None,
+    "open_candle_confluence":  None,
+    "open_candle_body_pct":    None,
+    "open_candle_upper_wick":  None,
+    "open_candle_lower_wick":  None,
+    "open_candle_vol_ratio":   None,
+    "open_candle_vwap_pos":    None,
+    # PDT trade counter
+    "day_trades_used":         0,
+    "day_trades_warning_sent": False,
+    # Multi-ticker secondary state
+    "multi_ticker_signal_sent": False,
+    "qqq_vol_gex_history":      [],
+    "tsla_vol_gex_history":     [],
+    "nvda_vol_gex_history":     [],
+    "googl_vol_gex_history":    [],
+    "qqq_last_score":           0,
+    "tsla_last_score":          0,
+    "nvda_last_score":          0,
+    "googl_last_score":         0,
+    "qqq_last_regime":          None,
+    "tsla_last_regime":         None,
+    "nvda_last_regime":         None,
+    "googl_last_regime":        None,
+    "qqq_last_grade":           None,
+    "tsla_last_grade":          None,
+    "nvda_last_grade":          None,
+    "googl_last_grade":         None,
+    # Legacy key kept for backward compat
+    "qqq_signal_sent":          False,
+    # Liquidity zones — updated every run_job, served instantly on command
+    "spy_liq_zone":             None,   # dict with low, high, target, stop zones
+    "qqq_liq_zone":             None,
+    "tsla_liq_zone":            None,
+    "nvda_liq_zone":            None,
+    "googl_liq_zone":           None,
+    # Command response cache — pre-built strings, served in <1s
+    # Updated by run_job and analyze_open_candle
+    "cache_status":             "",
+    "cache_levels":             "",     # /levels — SPY liquidity zones
+    "cache_all_levels":         "",     # /levels all — all tickers
+    "cache_last_updated":       0,
 }
 
 # ─────────────────────────────────────────────
@@ -1938,6 +2012,15 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "claude_confidence": claude_confidence,
             "claude_reasoning": claude_reasoning[:500] if claude_reasoning else "",
             "combined_score": combined_score,
+            # Candle fields — populated only on 6:35am row via state,
+            # blank on all other rows. Never breaks existing data.
+            "open_candle_type":       state.get("open_candle_type") or "",
+            "open_candle_body_pct":   state.get("open_candle_body_pct") or "",
+            "open_candle_upper_wick": state.get("open_candle_upper_wick") or "",
+            "open_candle_lower_wick": state.get("open_candle_lower_wick") or "",
+            "open_candle_vol_ratio":  state.get("open_candle_vol_ratio") or "",
+            "open_candle_vwap_pos":   state.get("open_candle_vwap_pos") or "",
+            "open_candle_confluence": state.get("open_candle_confluence") or "",
             "notes": ""
         }
         with open(LOG_FILE, "a", newline="") as f:
@@ -2347,6 +2430,8 @@ def run_job():
         vc_text, vanna_window = get_vanna_charm_read(vt, vs, ct, cs, price, conflict)
         state["current_vanna_target"] = vt
         state["current_charm_target"] = ct
+        # Update SPY liquidity zone — populates cache_levels for /levels command
+        update_spy_liquidity_zone(price, vt, ct)
         unwind_det, unwind_score, unwind_sigs, flow_dir = fetch_hedge_unwind_signals()
         regime, reg_conf = detect_regime(oi_gex, vol_gex, state["vol_gex_history"])
         reg_signal = get_regime_signal(regime, reg_conf, oi_b, vol_b)
@@ -2550,6 +2635,41 @@ def run_job():
                 cal_text  = "\n".join(cal_flags) if cal_flags else "No special events"
                 hist_ctx  = load_historical_context(days=30)
                 update_tag= "🔄 UPDATED — " if conv_changed else ""
+
+                # ── Multi-ticker comparison (Option C: only when SPY is weak) ──
+                spy_grade_clean = grade.split()[0] if grade else "F"
+                qqq_context = ""
+                if spy_grade_clean in SPY_WEAK_GRADES:
+                    # Quick scan of all secondary tickers for morning brief context
+                    best_alt_conv  = 0
+                    best_alt_lines = []
+                    grade_rank_map = {"A+": 5, "B+": 4, "C": 3, "D": 2, "F": 1}
+                    spy_rank_v     = grade_rank_map.get(spy_grade_clean, 1)
+                    for alt_t in ["QQQ", "GOOGL", "NVDA", "TSLA"]:
+                        try:
+                            ac, ag, ar, ap, ad, _, _ = fetch_ticker_signal(alt_t)
+                            agc = ag.split()[0] if ag else "F"
+                            best_alt_lines.append(
+                                f"  {alt_t}: {agc} ({ac}/100) | {ar}"
+                            )
+                            if ac > best_alt_conv:
+                                best_alt_conv   = ac
+                                best_alt_ticker = alt_t
+                                best_alt_grade  = agc
+                        except Exception:
+                            pass
+                    if best_alt_conv > conv:
+                        qqq_context = (
+                            f"\n\nALTERNATIVES (SPY is weak today):\n"
+                            + "\n".join(best_alt_lines) +
+                            f"\n→ Best pick: {best_alt_ticker} ({best_alt_grade})"
+                        )
+                        state["multi_ticker_signal_sent"] = True
+                        state["qqq_signal_sent"]          = True
+
+                # ── PDT status ──
+                pdt_note = check_pdt_status(conv, grade)
+
                 written = write_alert_with_claude(
                     alert_type="morning_report",
                     price=price, gex_state=gex_state, regime=regime,
@@ -2564,20 +2684,28 @@ def run_job():
                     claude_verdict=claude_verdict,
                     extra_context=(f"Calendar: {cal_text}\nVIX: {vix_sig}\n"
                                    f"VVIX: {vvix_sig}\nOPEX Phase: {cycle_phase}\n\n"
-                                   f"{hist_ctx}")
+                                   f"{hist_ctx}{qqq_context}")
                 )
+                trades_left = MAX_DAY_TRADES - state.get("day_trades_used", 0)
+                pdt_line = f"PDT: {state.get('day_trades_used',0)}/{MAX_DAY_TRADES} trades used ({trades_left} left)"
                 if written:
                     alert(f"🌅 {update_tag}MORNING BRIEF — SPY\n{'─'*35}\n"
-                          f"{now_str} PDT | ${price} | Score: {combined_score}/100\n\n{written}")
+                          f"{now_str} PDT | ${price} | Score: {combined_score}/100\n"
+                          f"{pdt_line}\n\n{written}{pdt_note}")
                 else:
                     cl_text = "\n".join(checklist)
                     alert(f"🌅 {update_tag}PRE-MARKET REPORT — SPY\n{'─'*35}\n"
-                          f"{now_str} PDT | ${price}\n\n"
+                          f"{now_str} PDT | ${price}\n{pdt_line}\n\n"
                           f"🎯 {conv}/100 — {grade}\n→ {rec}\n\n"
                           f"📅 Phase: {cycle_phase}\n"
                           f"📋 CHECKLIST\n{cl_text}\n\n"
-                          f"VIX: {vix_sig}\nVVIX: {vvix_sig}")
+                          f"VIX: {vix_sig}\nVVIX: {vvix_sig}"
+                          f"{qqq_context}{pdt_note}")
                 state["velocity_score_sent"] = True
+
+                # ── Fire standalone QQQ comparison alert if SPY weak ──
+                if spy_grade_clean in SPY_WEAK_GRADES and not state.get("qqq_signal_sent"):
+                    run_qqq_check(grade, conv, regime, now_str)
         # Alert flag resets
         if state["consolidation_alert_sent"]:
             if gex_state != state.get("consolidation_gex_state"):
@@ -2606,13 +2734,22 @@ def run_job():
             for k in ["velocity_score_sent","consolidation_alert_sent",
                       "hedge_unwind_alert_sent","open_drive_detected",
                       "doji_transition_sent","vol_gex_velocity_alert_sent",
-                      "gap_fill_alert_sent","gap_type_sent"]:
+                      "gap_fill_alert_sent","gap_type_sent",
+                      "open_candle_analyzed","qqq_signal_sent",
+                      "multi_ticker_signal_sent","day_trades_warning_sent"]:
                 state[k] = False
             for k in ["last_unwind_alert_time","last_summary_time",
-                      "last_heartbeat","last_wall_alert_price","gap_size"]:
+                      "last_heartbeat","last_wall_alert_price","gap_size",
+                      "day_trades_used"]:
                 state[k] = 0
             for k in ["consolidation_gex_state","open_price","open_iv","open_volume",
-                      "session_vwap","gap_direction","open_vol_gex_snapshot"]:
+                      "session_vwap","gap_direction","open_vol_gex_snapshot",
+                      "open_candle_type","open_candle_confluence",
+                      "open_candle_body_pct","open_candle_upper_wick",
+                      "open_candle_lower_wick","open_candle_vol_ratio",
+                      "open_candle_vwap_pos",
+                      "spy_liq_zone","qqq_liq_zone","tsla_liq_zone",
+                      "nvda_liq_zone","googl_liq_zone"]:
                 state[k] = None
             for k in ["open_time_prices","tick_history"]:
                 state[k] = []
@@ -2623,6 +2760,10 @@ def run_job():
             state["last_logged_row"] = {}
             state["gap_type"]        = "UNKNOWN"
             state["gap_conviction"]  = 0
+            state["cache_status"]    = ""
+            state["cache_levels"]    = ""
+            state["cache_all_levels"]= ""
+            state["cache_last_updated"] = 0
         # Update state
         state["previous_gex_state"] = gex_state
         state["previous_ratio"]     = ratio
@@ -2631,6 +2772,11 @@ def run_job():
         state["previous_regime"]    = regime
         state["regime"]             = regime
         state["last_conviction_score"] = conv
+        # Rebuild fast command caches — called last so all state is final
+        rebuild_command_cache(price, gex_state, regime, conv, grade,
+                              vix_sig, vvix_sig, flow_dir, unwind_score,
+                              vt, ct, cycle_phase)
+        build_all_levels_cache()
     except Exception as e:
         print(f"run_job error: {e}")
         import traceback; traceback.print_exc()
@@ -2654,43 +2800,94 @@ async def handle_telegram_updates():
                 state["telegram_last_update_id"] = update.update_id
             if not update.message: continue
             text = (update.message.text or "").strip()
-            # /status
+            # ── /status — instant from cache ───────────────────────────
             if text == "/status":
-                rows_today = overnight_rows = 0
-                last_time = "none"
-                csv_exists = os.path.exists(LOG_FILE)
-                if csv_exists:
-                    try:
-                        with open(LOG_FILE, "r", newline="") as f:
-                            all_rows = list(csv.DictReader(f))
-                        today_rows = [r for r in all_rows if r.get("date") == today_str]
-                        rows_today     = len([r for r in today_rows if r.get("session_type","MARKET") == "MARKET"])
-                        overnight_rows = len([r for r in today_rows if r.get("session_type") == "OVERNIGHT"])
-                        if today_rows: last_time = today_rows[-1].get("time","?")
-                    except Exception: pass
-                now_str = now_pdt().strftime("%H:%M")
+                msg = state.get("cache_status") or (
+                    f"Bot starting up — status ready after 6:00am PDT first reading.\n"
+                    f"APIs: UW:{'✅' if UW_TOKEN else '❌'} "
+                    f"Claude:{'✅' if anthropic_client else '❌'} "
+                    f"GitHub:{'✅' if GITHUB_TOKEN else '❌'}"
+                )
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                continue
+
+            # ── /levels — SPY zones, instant from cache ────────────────────
+            if text == "/levels":
+                msg = state.get("cache_levels") or (
+                    "📍 SPY levels not cached yet.\n"
+                    "Available after 6:30am PDT first reading."
+                )
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                continue
+
+            # ── /levels all — all tickers, instant from cache ─────────────
+            if text == "/levels all":
+                msg = state.get("cache_all_levels") or (
+                    "📍 All levels not cached yet.\n"
+                    "Available after secondary tickers scan (SPY D/F day)."
+                )
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                continue
+
+            # ── /pdt — instant from state ──────────────────────────────────
+            if text == "/pdt":
+                used = state.get("day_trades_used", 0)
+                left = MAX_DAY_TRADES - used
+                now_s = now_pdt().strftime("%H:%M")
+                status_line = (
+                    "🚫 LIMIT — 1DTE only" if left <= 0
+                    else "⚠️ LAST TRADE — A+/B+ only" if left == 1
+                    else "✅ Trades available"
+                )
                 await bot.send_message(chat_id=CHAT_ID, text=(
-                    f"📊 BOT STATUS\n{'─'*30}\n"
-                    f"Time: {now_str} PDT\n"
-                    f"Market open: {'YES' if is_market_open() else 'NO'}\n"
-                    f"Overnight window: {'YES' if is_overnight_window() else 'NO'}\n\n"
-                    f"📝 Today ({today_str}):\n"
-                    f"Market rows: {rows_today}\n"
-                    f"Overnight rows: {overnight_rows}\n"
-                    f"Last reading: {last_time} PDT\n"
-                    f"CSV: {'YES ✅' if csv_exists else 'NO ❌'}\n\n"
-                    f"🔄 State:\n"
-                    f"Regime: {state.get('regime','unknown')}\n"
-                    f"Score: {state.get('last_conviction_score',0)}/100\n\n"
-                    f"🔑 API keys:\n"
-                    f"UW: {'✅' if UW_TOKEN else '❌'} | "
-                    f"Claude: {'✅' if anthropic_client else '❌'}\n"
-                    f"GitHub: {'✅' if GITHUB_TOKEN else '❌'} | "
-                    f"Telegram: {'✅' if TELEGRAM_TOKEN else '❌'}\n\n"
-                    f"💡 GitHub ❌? Add GITHUB_TOKEN to Railway vars."
+                    f"📊 PDT — {now_s} PDT\n\n"
+                    f"Used: {used}/{MAX_DAY_TRADES}  Left: {left}\n"
+                    f"{status_line}\n\n"
+                    f"/trade to log a day trade."
                 ))
                 continue
-            # /overnight
+
+            # ── /trade — log a day trade, instant ─────────────────────────
+            if text == "/trade":
+                used  = state.get("day_trades_used", 0) + 1
+                state["day_trades_used"] = used
+                left  = MAX_DAY_TRADES - used
+                msg   = f"✅ Trade logged: {used}/{MAX_DAY_TRADES} — {left} left\n"
+                msg  += ("🚫 PDT limit. 1DTE entries only." if left <= 0
+                         else "⚠️ One trade left — best signal only." if left == 1
+                         else f"{left} remaining.")
+                await bot.send_message(chat_id=CHAT_ID, text=msg)
+                continue
+
+            # ── /tickers /qqq — instant from state ────────────────────────
+            if text in ("/qqq", "/tickers"):
+                spy_c = state.get("last_conviction_score", 0)
+                if spy_c >= 80: spy_g = "A+"
+                elif spy_c >= 65: spy_g = "B+"
+                elif spy_c >= 50: spy_g = "C"
+                elif spy_c >= 35: spy_g = "D"
+                else: spy_g = "F"
+                lines = [f"🔵 SPY  {spy_g} ({spy_c}/100) | {state.get('regime','—')}"]
+                for t in ["QQQ","TSLA","NVDA","GOOGL"]:
+                    sc = state.get(f"{t.lower()}_last_score", 0)
+                    gr = (state.get(f"{t.lower()}_last_grade") or "—")
+                    re = state.get(f"{t.lower()}_last_regime") or "—"
+                    gc = gr.split()[0] if gr not in ("—","") else "—"
+                    lines.append(f"{'⚫' if sc==0 else '⚪'} {t:5s} {gc} ({sc}/100) | {re}")
+                best_t  = max(["QQQ","TSLA","NVDA","GOOGL"],
+                              key=lambda t: state.get(f"{t.lower()}_last_score", 0))
+                best_s  = state.get(f"{best_t.lower()}_last_score", 0)
+                note    = (f"\n🏆 Best alt: {best_t} ({best_s}/100)" if best_s > spy_c
+                           else "\n✅ SPY leads today")
+                if all(state.get(f"{t.lower()}_last_score",0)==0 for t in ["QQQ","TSLA","NVDA","GOOGL"]):
+                    note += "\n(Secondaries run when SPY is D/F — use /tickers then)"
+                now_s = now_pdt().strftime("%H:%M")
+                await bot.send_message(chat_id=CHAT_ID, text=(
+                    f"📊 TICKERS — {now_s} PDT\n\n" + "\n".join(lines) + note
+                ))
+                continue
+
+            # ── /overnight — still live (must be fresh data) ──────────────
             if text == "/overnight":
                 now_str = now_pdt().strftime("%H:%M")
                 await bot.send_message(chat_id=CHAT_ID,
@@ -2701,39 +2898,41 @@ async def handle_telegram_updates():
                 fut_chg   = overnight.get("futures_change_pct",0) or 0
                 vix_curr  = overnight.get("vix_current","N/A")
                 cat       = overnight.get("catalyst_type","NONE")
-                msg = (f"🌙 OVERNIGHT SNAPSHOT — SPY\n{'─'*35}\n{now_str} PDT\n\n"
-                       f"ES Futures: {fut_dir} {fut_chg:+.2f}%\n"
+                msg = (f"🌙 OVERNIGHT — SPY\n{'─'*30}\n{now_str} PDT\n\n"
+                       f"Futures: {fut_dir} {fut_chg:+.2f}%\n"
                        f"VIX: {vix_curr} | Catalyst: {cat}\n\n"
-                       f"{written if written else 'Full update at next scheduled check.'}")
+                       + (written or "Full update at next check."))
                 await bot.send_message(chat_id=CHAT_ID, text=msg)
                 log_overnight_reading(overnight)
                 continue
-            # /notes
+
+            # ── /notes — writes to CSV ─────────────────────────────────────
             if text.startswith("/notes"):
                 note = text[6:].strip()
                 if not note:
-                    await bot.send_message(chat_id=CHAT_ID, text=(
-                        "💬 Usage: /notes [your context]\n\n"
-                        "Examples:\n/notes Iran ceasefire drove rally\n"
-                        "/notes Fed pause rumor bearish"))
+                    await bot.send_message(chat_id=CHAT_ID,
+                        text="Usage: /notes [text]\nExample: /notes Iran news drove gap fade")
                     continue
                 if not os.path.exists(LOG_FILE):
                     await bot.send_message(chat_id=CHAT_ID,
-                        text="⚠️ No log file yet — will be created at next market reading.")
+                        text="No log yet — available after first market reading.")
                     continue
                 with open(LOG_FILE, "r", newline="") as f:
                     rows = list(csv.DictReader(f))
                 updated = 0
                 for row in rows:
                     if row["date"] == today_str:
-                        row["notes"] = note; updated += 1
+                        row["notes"] = note
+                        updated += 1
                 with open(LOG_FILE, "w", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
-                    writer.writeheader(); writer.writerows(rows)
+                    writer.writeheader()
+                    writer.writerows(rows)
                 await bot.send_message(chat_id=CHAT_ID, text=(
-                    f"✅ Note saved to {updated} rows\n"
-                    f"Date: {today_str}\nNote: {note}"))
+                    f"✅ Note saved to {updated} rows: {note}"))
                 git_commit_log(reason="notes")
+                continue
+
     except Exception as e:
         print(f"Telegram command error: {e}")
 
@@ -2741,8 +2940,813 @@ def check_telegram_commands():
     asyncio.run(handle_telegram_updates())
 
 # ─────────────────────────────────────────────
-# MIDNIGHT RESET
+# MODULE: OPEN CANDLE ANALYSIS
+# Runs at 6:35am after first 5-min candle closes.
+# Reads body size, wick ratio, volume vs average,
+# VWAP position, and checks confluence with the
+# pre-market GEX thesis.
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# MODULE: QQQ SECONDARY SIGNAL
+# Only runs when SPY conviction is D or F.
+# Uses same GEX + regime logic as SPY.
+# VXN (Nasdaq volatility) instead of VIX.
+# Generic functions that work for any ticker.
+# SPY continues to use its own dedicated modules.
+# ─────────────────────────────────────────────
+
+# Generic functions that work for any ticker.
+# SPY continues to use its own dedicated modules.
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
+# MODULE: LIQUIDITY ZONE ENGINE
+# ─────────────────────────────────────────────
+# Computes the price range a ticker is expected
+# to travel and the key levels for contract selection.
+#
+# TARGET     — where price is being pulled (profit exit)
+# SUPPORT    — where buyers defend (stop zone for puts)
+# RESISTANCE — where sellers wait (stop zone for calls)
+# RANGE      — expected low to high for today
+# ─────────────────────────────────────────────
+
+def compute_liquidity_zones(ticker, price, vanna_target=None,
+                             charm_target=None, vwap=None,
+                             prev_close=None, session_high=None,
+                             session_low=None):
+    """
+    Returns a dict with all key levels for the ticker.
+    Uses pivot points, ATR, vanna/charm, VWAP, and
+    round-number magnetism to define the expected range.
+    """
+    zones = {
+        "ticker": ticker, "price": round(price, 2),
+        "target": None, "target2": None,
+        "support": None, "resistance": None,
+        "run_low": None, "run_high": None,
+        "atr": None,
+        "contract_guide": "", "levels_text": "",
+    }
+    try:
+        df = yf.download(ticker, period="5d", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        pivot = pp_r1 = pp_r2 = pp_s1 = pp_s2 = atr = None
+
+        if not df.empty and len(df) >= 2:
+            prev   = df.iloc[-2]
+            ph, pl, pc = float(prev["High"]), float(prev["Low"]), float(prev["Close"])
+            pivot  = round((ph + pl + pc) / 3, 2)
+            pp_r1  = round(2 * pivot - pl, 2)
+            pp_r2  = round(pivot + (ph - pl), 2)
+            pp_s1  = round(2 * pivot - ph, 2)
+            pp_s2  = round(pivot - (ph - pl), 2)
+            highs  = df["High"].values.flatten().astype(float)
+            lows   = df["Low"].values.flatten().astype(float)
+            closes = df["Close"].values.flatten().astype(float)
+            trs = [max(highs[i]-lows[i],
+                       abs(highs[i]-closes[i-1]),
+                       abs(lows[i]-closes[i-1]))
+                   for i in range(1, len(highs))]
+            atr = round(float(np.mean(trs[-5:])), 2) if trs else None
+            zones["atr"] = atr
+
+        # Round-number levels ($5 increments)
+        r5_above = round(np.ceil(price / 5) * 5, 2)
+        r5_below = round(np.floor(price / 5) * 5, 2)
+        if r5_above == price: r5_above += 5
+        if r5_below == price: r5_below -= 5
+
+        # Assign primary target
+        if vanna_target:
+            zones["target"] = vanna_target
+            zones["target2"] = charm_target if charm_target and charm_target != vanna_target \
+                                else (r5_above if vanna_target > price else r5_below)
+        else:
+            zones["target"]  = pp_r1 or r5_above
+            zones["target2"] = pp_s1 or r5_below
+
+        # Resistance and support
+        zones["resistance"] = pp_r1 or r5_above
+        zones["support"]    = pp_s1 or r5_below
+
+        # VWAP refines support/resistance
+        if vwap:
+            if price > vwap:
+                zones["support"] = max(round(vwap, 2), zones["support"] or round(vwap, 2))
+            else:
+                zones["resistance"] = min(round(vwap, 2), zones["resistance"] or round(vwap, 2))
+
+        # Expected daily range
+        if atr:
+            zones["run_low"]  = round(price - atr * 0.8, 2)
+            zones["run_high"] = round(price + atr * 0.8, 2)
+        else:
+            zones["run_low"]  = pp_s2 or round(r5_below - 5, 2)
+            zones["run_high"] = pp_r2 or round(r5_above + 5, 2)
+
+        if prev_close:
+            zones["run_low"] = min(zones["run_low"], round(prev_close * 0.99, 2))
+
+        # Contract selection guide
+        t  = zones["target"]
+        t2 = zones["target2"]
+        s  = zones["support"]
+        r  = zones["resistance"]
+        rl = zones["run_low"]
+        rh = zones["run_high"]
+        regime = state.get("regime", "UNKNOWN")
+
+        if regime == "BEARISH_HEDGE_BUILD":
+            zones["contract_guide"] = (
+                f"PUTS:\n"
+                f"  Buy:    ATM or ${round(price-1,0):.0f}P\n"
+                f"  Target: ${t:.2f}" + (f" then ${t2:.2f}" if t2 else "") + "\n"
+                f"  Stop:   price closes back above ${r:.2f}\n"
+                f"  Range:  ${rl:.2f} – ${rh:.2f} today"
+            )
+        elif regime in ("HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM", "HEDGE_UNWIND_EARLY"):
+            zones["contract_guide"] = (
+                f"CALLS:\n"
+                f"  Buy:    ATM or ${round(price+1,0):.0f}C\n"
+                f"  Target: ${t:.2f}" + (f" then ${t2:.2f}" if t2 else "") + "\n"
+                f"  Stop:   price closes below ${s:.2f}\n"
+                f"  Range:  ${rl:.2f} – ${rh:.2f} today"
+            )
+        else:
+            zones["contract_guide"] = (
+                f"No regime — wait for confirmation\n"
+                f"  Support:    ${s:.2f}\n"
+                f"  Resistance: ${r:.2f}\n"
+                f"  Range:      ${rl:.2f} – ${rh:.2f} today"
+            )
+
+        # Formatted text block
+        van_line   = f"  Vanna pull:  ${vanna_target:.2f}\n" if vanna_target else ""
+        charm_line = f"  Charm wall:  ${charm_target:.2f}\n" if charm_target else ""
+        vwap_line  = f"  VWAP:        ${round(vwap,2)}\n"   if vwap       else ""
+        atr_line   = f"  ATR (5d):    ${atr:.2f}\n"         if atr        else ""
+
+        zones["levels_text"] = (
+            f"{ticker} @ ${price:.2f}\n"
+            f"{'─'*28}\n"
+            f"  Range:       ${rl:.2f} – ${rh:.2f}\n"
+            f"  Resistance:  ${r:.2f}\n"
+            f"  Target:      ${t:.2f}" +
+            (f" → ${t2:.2f}" if t2 else "") + "\n"
+            f"  Support:     ${s:.2f}\n"
+            + vwap_line + van_line + charm_line + atr_line +
+            f"\n{zones['contract_guide']}"
+        )
+
+    except Exception as e:
+        print(f"Liq zone error {ticker}: {e}")
+        zones["levels_text"] = f"{ticker} @ ${price:.2f} — levels unavailable"
+
+    return zones
+
+
+def update_spy_liquidity_zone(price, vt, ct):
+    """Updates SPY zone + rebuilds /levels cache. Called from run_job."""
+    try:
+        zone = compute_liquidity_zones(
+            "SPY", price,
+            vanna_target=vt, charm_target=ct,
+            vwap=state.get("session_vwap"),
+            prev_close=state.get("prev_session_close"),
+            session_high=state.get("session_high"),
+            session_low=state.get("session_low"),
+        )
+        state["spy_liq_zone"] = zone
+        now_str = now_pdt().strftime("%H:%M")
+        state["cache_levels"] = (
+            f"📍 SPY LEVELS — {now_str} PDT\n\n" + zone["levels_text"]
+        )
+        state["cache_last_updated"] = time.time()
+        print(f"💧 SPY zone: ${zone.get('run_low')}–${zone.get('run_high')}"
+              f" | target ${zone.get('target')}")
+    except Exception as e:
+        print(f"SPY zone update error: {e}")
+
+
+def update_ticker_liquidity_zone(ticker, price):
+    """Compute and cache zone for a secondary ticker. Called from fetch_ticker_signal."""
+    try:
+        zone = compute_liquidity_zones(ticker, price,
+                                        vwap=None, prev_close=None)
+        state[f"{ticker.lower()}_liq_zone"] = zone
+    except Exception as e:
+        print(f"{ticker} zone error: {e}")
+
+
+def build_all_levels_cache():
+    """Rebuilds /levels all cache from already-cached zones. No API calls."""
+    try:
+        now_str  = now_pdt().strftime("%H:%M")
+        parts    = [f"📍 ALL LEVELS — {now_str} PDT\n"]
+        for t in ["SPY", "QQQ", "TSLA", "NVDA", "GOOGL"]:
+            key  = f"{t.lower()}_liq_zone"
+            zone = state.get(key)
+            if zone and zone.get("levels_text"):
+                parts.append(zone["levels_text"])
+        state["cache_all_levels"] = "\n\n".join(parts)
+    except Exception as e:
+        print(f"All levels cache error: {e}")
+
+
+# ─────────────────────────────────────────────
+# COMMAND CACHE BUILDER
+# Pre-builds /status response string after each
+# run_job. Commands read from cache — <100ms.
+# ─────────────────────────────────────────────
+
+def rebuild_command_cache(price, gex_state, regime, conv, grade,
+                          vix_sig, vvix_sig, flow_dir, unwind_score,
+                          vt, ct, cycle_phase):
+    """Rebuilds fast-response cache strings. Called at end of run_job."""
+    try:
+        now_str    = now_pdt().strftime("%H:%M")
+        today_str  = now_pdt().strftime("%Y-%m-%d")
+        trades_left= MAX_DAY_TRADES - state.get("day_trades_used", 0)
+        vt_str = f"${vt:.2f}" if vt else "—"
+        ct_str = f"${ct:.2f}" if ct else "—"
+
+        def gs(ticker):
+            s = state.get(f"{ticker.lower()}_last_score", 0)
+            g = state.get(f"{ticker.lower()}_last_grade") or "—"
+            r = state.get(f"{ticker.lower()}_last_regime") or "—"
+            gc = g.split()[0] if g and g != "—" else "—"
+            return f"{gc} ({s}/100) | {r}"
+
+        state["cache_status"] = (
+            f"📊 STATUS — {now_str} PDT\n"
+            f"{'─'*28}\n\n"
+            f"SPY  ${round(price,2)} | {gex_state}\n"
+            f"     {grade.split()[0]} ({conv}/100) | {regime}\n"
+            f"     Vanna:{vt_str} | Charm:{ct_str}\n"
+            f"     Unwind:{unwind_score}/100 | {cycle_phase}\n\n"
+            f"QQQ  {gs('qqq')}\n"
+            f"TSLA {gs('tsla')}\n"
+            f"NVDA {gs('nvda')}\n"
+            f"GOOGL {gs('googl')}\n\n"
+            f"VIX:  {vix_sig}\n"
+            f"VVIX: {vvix_sig}\n"
+            f"Flow: {flow_dir}\n\n"
+            f"PDT: {state.get('day_trades_used',0)}/{MAX_DAY_TRADES} "
+            f"({trades_left} left)\n"
+            f"APIs: UW:{'✅' if UW_TOKEN else '❌'} "
+            f"Claude:{'✅' if anthropic_client else '❌'} "
+            f"GitHub:{'✅' if GITHUB_TOKEN else '❌'}"
+        )
+        state["cache_last_updated"] = time.time()
+    except Exception as e:
+        print(f"Cache rebuild error: {e}")
+
+
+def fetch_ticker_gex(ticker):
+    """Fetch GEX for any UW-supported ticker."""
+    try:
+        url = f"https://api.unusualwhales.com/api/stock/{ticker}/spot-exposures"
+        headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()["data"]
+        if not data:
+            return None, None, None
+        latest  = data[-1]
+        oi_gex  = float(latest["gamma_per_one_percent_move_oi"])
+        vol_gex = float(latest["gamma_per_one_percent_move_vol"])
+        price   = float(latest["price"])
+        return oi_gex, vol_gex, price
+    except Exception as e:
+        print(f"{ticker} GEX error: {e}")
+        return None, None, None
+
+
+def fetch_ticker_iv(ticker, iv_ticker_symbol):
+    """
+    Fetch implied volatility for any ticker.
+
+    QQQ  -> VXN  (Nasdaq VIX equivalent)
+    TSLA/NVDA/GOOGL -> IV rank from UW API
+      IV rank 0-100: where 50 = median historical IV
+      Above 50 = elevated, above 80 = extreme
+
+    Returns: iv_spot, iv_term, iv_sig
+    """
+    try:
+        if iv_ticker_symbol:
+            iv_h   = yf.Ticker(iv_ticker_symbol).history(period="5d", interval="1d")
+            vix3m  = yf.Ticker("^VIX3M").history(period="2d", interval="1d")
+            iv_spot = float(iv_h["Close"].iloc[-1])  if not iv_h.empty  else None
+            v3m_val = float(vix3m["Close"].iloc[-1]) if not vix3m.empty else None
+            if iv_spot and v3m_val:
+                if iv_spot > v3m_val * 1.15:
+                    iv_term = "BACKWARDATION"
+                elif iv_spot < v3m_val * 0.95:
+                    iv_term = "CONTANGO"
+                else:
+                    iv_term = "FLAT"
+            else:
+                iv_term = "UNKNOWN"
+            if iv_spot:
+                if iv_spot >= 35:
+                    iv_sig = f"EXTREME ({round(iv_spot,1)})"
+                elif iv_spot >= 25:
+                    iv_sig = f"ELEVATED ({round(iv_spot,1)})"
+                elif iv_spot >= 18:
+                    iv_sig = f"MODERATE ({round(iv_spot,1)})"
+                else:
+                    iv_sig = f"LOW ({round(iv_spot,1)})"
+            else:
+                iv_sig = "Unavailable"
+            return iv_spot, iv_term, iv_sig
+
+        # IV rank from UW API (single stocks)
+        r = requests.get(
+            f"https://api.unusualwhales.com/api/stock/{ticker}/iv-rank",
+            headers={"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"},
+            timeout=8
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            iv_rank = float(data.get("iv_rank", 50) or 50) if data else 50.0
+            if iv_rank >= 80:
+                iv_term = "BACKWARDATION"
+                iv_sig  = f"IV RANK {round(iv_rank)} — Extreme"
+            elif iv_rank >= 60:
+                iv_term = "FLAT"
+                iv_sig  = f"IV RANK {round(iv_rank)} — Elevated"
+            elif iv_rank >= 40:
+                iv_term = "FLAT"
+                iv_sig  = f"IV RANK {round(iv_rank)} — Normal"
+            else:
+                iv_term = "CONTANGO"
+                iv_sig  = f"IV RANK {round(iv_rank)} — Low"
+            return iv_rank, iv_term, iv_sig
+
+        return None, "UNKNOWN", "Unavailable"
+    except Exception as e:
+        print(f"{ticker} IV error: {e}")
+        return None, "UNKNOWN", "Unavailable"
+
+
+def fetch_ticker_signal(ticker):
+    """
+    Generic signal scorer for any secondary ticker.
+    Returns: score, grade, regime, price, direction, iv_sig, summary
+
+    Uses identical logic to SPY:
+    - GEX fetch from UW API
+    - Regime detection (same algorithm)
+    - Conviction scorer (same weights)
+    - IV rank or index replaces VIX
+    - VVIX still used market-wide
+    - Same unwind detector
+    """
+    try:
+        cfg = SECONDARY_TICKERS.get(ticker, {})
+        iv_ticker_sym = cfg.get("iv_ticker")
+        vol_hist_key  = cfg.get("vol_history_key",
+                                f"{ticker.lower()}_vol_gex_history")
+
+        oi_gex, vol_gex, price = fetch_ticker_gex(ticker)
+        if oi_gex is None or vol_gex == 0:
+            return 0, "F", "INSUFFICIENT_DATA", 0, "NEUTRAL", "N/A",                    f"{ticker} data unavailable"
+
+        hist = state.setdefault(vol_hist_key, [])
+        hist.append(vol_gex)
+        if len(hist) > 10:
+            hist.pop(0)
+
+        ratio = abs(vol_gex) / abs(oi_gex) if oi_gex != 0 else 0
+        regime, _ = detect_regime(oi_gex, vol_gex, hist)
+        iv_spot, iv_term, iv_sig = fetch_ticker_iv(ticker, iv_ticker_sym)
+
+        vvix_h   = yf.Ticker("^VVIX").history(period="2d", interval="1d")
+        vvix_val = float(vvix_h["Close"].iloc[-1]) if not vvix_h.empty else None
+
+        _, unwind_score, _, _ = fetch_hedge_unwind_signals_for(ticker)
+
+        pdt_t = now_pdt()
+        vanna_window = ((pdt_t.hour - 6) * 60 + pdt_t.minute - 30) < 270
+        _, cal_bonus, _, _ = get_calendar_flags()
+
+        tick_approx, inv_bias = 0, "NEUTRAL"
+        try:
+            df = yf.download(ticker, period="1d", interval="1m", progress=False)
+            if not df.empty and len(df) >= 10:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                closes = df["Close"].iloc[-10:].values.flatten().astype(float)
+                opens  = df["Open"].iloc[-10:].values.flatten().astype(float)
+                up   = sum(1 for c, o in zip(closes, opens) if c > o)
+                down = sum(1 for c, o in zip(closes, opens) if c < o)
+                tick_approx = (up - down) * 100
+                cp = float(df["Close"].iloc[-1])
+                vw = float(
+                    (df["Close"] * df["Volume"]).cumsum().iloc[-1]
+                    / df["Volume"].cumsum().iloc[-1]
+                )
+                inv_bias = ("BULL ZONE" if cp > vw * 1.002
+                            else "BEAR ZONE" if cp < vw * 0.998
+                            else "NEUTRAL")
+        except Exception:
+            pass
+
+        conv, grade, rec, _ = score_conviction(
+            vix_spot=iv_spot, vvix_val=vvix_val, vix_term=iv_term,
+            vol_gex=vol_gex, prev_vol_gex=None, regime=regime,
+            unwind_score=unwind_score, cal_bonus=cal_bonus,
+            vanna_window=vanna_window, conflict=False, ratio=ratio,
+            tick_approx=tick_approx, inv_bias=inv_bias, open_drive=False
+        )
+
+        if regime == "BEARISH_HEDGE_BUILD":
+            direction = "BEARISH"
+        elif regime in ("HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM"):
+            direction = "BULLISH"
+        elif regime == "HEDGE_UNWIND_EARLY":
+            direction = "EARLY BULLISH"
+        else:
+            direction = "NEUTRAL"
+
+        state[f"{ticker.lower()}_last_score"]  = conv
+        state[f"{ticker.lower()}_last_regime"] = regime
+        state[f"{ticker.lower()}_last_grade"]  = grade
+        # Update this ticker's liquidity zone for /levels all command
+        update_ticker_liquidity_zone(ticker, price)
+
+        summary = (f"{ticker} ${round(price,2)} | {grade.split()[0]} ({conv}/100)"
+                   f" | {regime} | {direction}")
+        print(f"📊 {ticker}: {summary}")
+        return conv, grade, regime, price, direction, iv_sig, summary
+
+    except Exception as e:
+        print(f"{ticker} signal error: {e}")
+        return 0, "F", "INSUFFICIENT_DATA", 0, "NEUTRAL", "N/A",                f"{ticker} error: {e}"
+
+
+def fetch_hedge_unwind_signals_for(ticker):
+    """Same unwind detector as SPY — works for any ticker."""
+    try:
+        url = f"https://api.unusualwhales.com/api/stock/{ticker}/options-contracts"
+        headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
+        response = requests.get(url, headers=headers,
+                                params={"limit": 100, "order": "desc"}, timeout=10)
+        data = response.json().get("data", [])
+        if not data:
+            return False, 0, [], "NEUTRAL"
+        signals, score = [], 0
+        for contract in data:
+            try:
+                ctype  = str(contract.get("type", "")).upper()
+                volume = float(contract.get("volume", 0) or 0)
+                oi     = float(contract.get("open_interest", 0) or 0)
+                strike = float(contract.get("strike", 0) or 0)
+                exec_  = str(contract.get("execution_estimate", "")).upper()
+                ratio  = volume / oi if oi > 0 else 0
+                is_put = "PUT" in ctype
+                is_call= "CALL" in ctype
+                if is_put and ratio >= 50 and volume >= 2000:
+                    score += 25
+                    signals.append(f"PUT HEDGE CLOSING ${strike:.0f}P {round(ratio)}x")
+                elif is_put and ratio >= 10 and volume >= 500:
+                    score += 10
+                    signals.append(f"PUT CLOSING ${strike:.0f}P {round(ratio)}x")
+                if is_put and "DESCENDING" in exec_ and volume >= 500:
+                    score += 15
+                    signals.append(f"DESCENDING FILL ${strike:.0f}P")
+                if is_call and "SWEEP" in exec_ and volume >= 500:
+                    score += 8
+                    signals.append(f"CALL SWEEP ${strike:.0f}C")
+            except Exception:
+                continue
+        score = min(score, 100)
+        if score >= 40: return True, score, signals[:6], "BULLISH"
+        if score >= 20: return True, score, signals[:6], "LEANING BULLISH"
+        return False, score, signals[:6], "NEUTRAL"
+    except Exception as e:
+        print(f"Unwind {ticker} error: {e}")
+        return False, 0, [], "UNAVAILABLE"
+
+
+def run_multi_ticker_check(spy_grade, spy_conv, spy_regime, now_str):
+    """
+    Runs all 4 secondary tickers when SPY is D or F.
+    Ranks by conviction score. Fires ONE alert with
+    the full ranking and the recommended trade.
+    """
+    if state.get("multi_ticker_signal_sent"):
+        return
+
+    grade_rank = {"A+": 5, "B+": 4, "C": 3, "D": 2, "F": 1}
+    spy_rank   = grade_rank.get(
+        spy_grade.split()[0] if spy_grade else "F", 1)
+
+    results = []
+    for ticker in ["QQQ", "GOOGL", "NVDA", "TSLA"]:
+        try:
+            conv, grade, regime, price, direction, iv_sig, summary =                 fetch_ticker_signal(ticker)
+            results.append({
+                "ticker": ticker, "conv": conv, "grade": grade,
+                "gc":     grade.split()[0] if grade else "F",
+                "regime": regime, "price": price,
+                "direction": direction, "iv_sig": iv_sig,
+            })
+        except Exception as e:
+            print(f"Multi-check {ticker}: {e}")
+
+    if not results:
+        return
+
+    results.sort(key=lambda x: x["conv"], reverse=True)
+    best      = results[0]
+    best_rank = grade_rank.get(best["gc"], 1)
+
+    if best_rank <= spy_rank and best_rank < 3:
+        print(f"No secondary ticker better than SPY ({spy_grade}) — no alert")
+        return
+
+    de = {"BEARISH": "🔴", "BULLISH": "🟢",
+          "EARLY BULLISH": "🟡", "NEUTRAL": "⚪"}
+    am = {"BEARISH": "PUTS — wait for open candle confirmation",
+          "BULLISH": "CALLS — wait for open candle confirmation",
+          "EARLY BULLISH": "Prepare calls — not confirmed yet",
+          "NEUTRAL": "Wait — no clear direction"}
+
+    trades_left = MAX_DAY_TRADES - state.get("day_trades_used", 0)
+    pdt_note = ""
+    if trades_left <= 0:
+        pdt_note = "\n\n🚫 PDT LIMIT — 1DTE entries only today"
+    elif trades_left == 1:
+        pdt_note = f"\n\n⚠️ Last day trade — use on {best['ticker']} only"
+
+    rows = []
+    for i, r in enumerate(results, 1):
+        rows.append(
+            f"  {i}. {de.get(r['direction'],'⚪')} {r['ticker']:5s}"
+            f" {r['gc']:3s} ({r['conv']:3d}/100) | {r['regime']}"
+        )
+
+    alert(
+        f"📊 TICKER RANKINGS — SPY {spy_grade.split()[0]} today\n"
+        f"{'─'*35}\n"
+        f"{now_str} PDT\n\n"
+        f"🔵 SPY: {spy_grade.split()[0]} ({spy_conv}/100) — skip\n\n"
+        f"ALTERNATIVES:\n" + "\n".join(rows) +
+        f"\n\n{'─'*20}\n"
+        f"🏆 BEST TRADE: {best['ticker']}\n"
+        f"${round(best['price'],2)} | {best['gc']} ({best['conv']}/100)\n"
+        f"Regime: {best['regime']}\n"
+        f"Direction: {de.get(best['direction'],'')} {best['direction']}\n"
+        f"→ {am.get(best['direction'],'Wait')}\n"
+        f"IV: {best['iv_sig']}" + pdt_note
+    )
+
+    state["multi_ticker_signal_sent"] = True
+    state["qqq_signal_sent"]          = True
+    print(f"Multi-ticker alert fired: best={best['ticker']} {best['gc']} ({best['conv']})")
+
+
+def run_qqq_check(spy_grade, spy_conv, spy_regime, now_str):
+    """Backward-compat wrapper — now runs all tickers."""
+    run_multi_ticker_check(spy_grade, spy_conv, spy_regime, now_str)
+
+# ─────────────────────────────────────────────
+# MODULE: PDT TRADE COUNTER
+# Tracks day trades used this week.
+# Warns when approaching limit.
+# /pdt command shows current count.
+# /trade command increments counter.
+# ─────────────────────────────────────────────
+
+def check_pdt_status(conv, grade):
+    """
+    Called after every signal alert.
+    Warns if approaching PDT limit.
+    Returns a PDT note string to append to alerts.
+    """
+    used   = state.get("day_trades_used", 0)
+    left   = MAX_DAY_TRADES - used
+    grade_clean = grade.split()[0] if grade else "?"
+
+    if left <= 0:
+        return (
+            f"\n\n🚫 PDT LIMIT REACHED ({used}/{MAX_DAY_TRADES})\n"
+            f"No more day trades available today.\n"
+            f"1DTE entry only — held overnight won't count."
+        )
+    elif left == 1:
+        if not state.get("day_trades_warning_sent"):
+            state["day_trades_warning_sent"] = True
+            return (
+                f"\n\n⚠️ LAST DAY TRADE ({used}/{MAX_DAY_TRADES} used)\n"
+                f"Use it wisely — only {grade_clean} grade or better.\n"
+                f"Or enter 1DTE and hold overnight to skip PDT count."
+            )
+    return ""
+
+
+def analyze_open_candle():
+    if not is_market_open():
+        return
+    pdt = now_pdt()
+    h, m = pdt.hour, pdt.minute
+    # Only fires 6:34-6:42am — after first candle closes, before second job
+    if not (h == 6 and 34 <= m <= 42):
+        return
+    if state.get("open_candle_analyzed"):
+        return
+    try:
+        spy = yf.download("SPY", period="1d", interval="5m", progress=False)
+        if spy.empty or len(spy) < 3:
+            print("Open candle: not enough bars yet")
+            return
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+
+        # First candle = most recent completed 5-min bar
+        first  = spy.iloc[-1]
+        o_     = float(first["Open"])
+        c_     = float(first["Close"])
+        h_     = float(first["High"])
+        l_     = float(first["Low"])
+        vol_   = float(first["Volume"])
+
+        # Average volume: prior 10 bars (pre-open context)
+        avg_vol = float(spy["Volume"].iloc[:-1].tail(10).mean())
+
+        # Candle geometry
+        full_range  = h_ - l_
+        if full_range < 0.01:
+            print("Open candle: zero-range candle, skipping")
+            return
+        body        = abs(c_ - o_)
+        upper_wick  = h_ - max(o_, c_)
+        lower_wick  = min(o_, c_) - l_
+        body_pct    = round((body / full_range) * 100)
+        upper_pct   = round((upper_wick / full_range) * 100)
+        lower_pct   = round((lower_wick / full_range) * 100)
+        is_bear     = c_ < o_
+        is_bull     = c_ > o_
+        vol_ratio   = round(vol_ / avg_vol, 2) if avg_vol > 0 else 1.0
+        vol_surge   = vol_ratio >= 1.5
+
+        vwap      = state.get("session_vwap")
+        gap_type  = state.get("gap_type", "UNKNOWN")
+        regime    = state.get("regime", "UNKNOWN")
+        conv      = state.get("last_conviction_score", 0)
+        now_str   = pdt.strftime("%H:%M")
+
+        # ── CANDLE TYPE ──────────────────────────
+        if body_pct >= 60 and vol_surge:
+            if is_bear:
+                ctype  = "STRONG_BEAR"
+                cemoji = "🔴"
+                cread  = "Large red body + volume surge — institutions selling aggressively"
+                action = "PUTS — full size. This is the candle that produces 400-700% days."
+            else:
+                ctype  = "STRONG_BULL"
+                cemoji = "🟢"
+                cread  = "Large green body + volume surge — institutions buying aggressively"
+                action = "CALLS — full size. Strong institutional conviction on open."
+
+        elif upper_pct >= 40:
+            ctype  = "REJECTION_WICK_TOP"
+            cemoji = "⬇️"
+            cread  = (f"Long upper wick ({upper_pct}% of range) — "
+                      f"gap up immediately rejected by sellers")
+            action = "PUTS on next red candle. Rejection wicks at open = cleanest put entry."
+
+        elif lower_pct >= 40:
+            ctype  = "REJECTION_WICK_BOTTOM"
+            cemoji = "⬆️"
+            cread  = (f"Long lower wick ({lower_pct}% of range) — "
+                      f"gap down immediately rejected by buyers")
+            action = "CALLS on next green candle. Rejection wicks at open = cleanest call entry."
+
+        elif body_pct < 30:
+            ctype  = "DOJI"
+            cemoji = "⚪"
+            cread  = (f"Doji — body only {body_pct}% of range. "
+                      f"No conviction either direction.")
+            action = ("WAIT. Do not enter. Watch next candle. "
+                      "This open will chop 15-30min before committing.")
+
+        elif body_pct >= 40:
+            if is_bear:
+                ctype  = "MODERATE_BEAR"
+                cemoji = "🟠"
+                cread  = f"Moderate red candle ({body_pct}% body) — bearish lean"
+                action = ("PUTS half size on VWAP rejection. "
+                          "Wait for second candle to confirm before adding.")
+            else:
+                ctype  = "MODERATE_BULL"
+                cemoji = "🟡"
+                cread  = f"Moderate green candle ({body_pct}% body) — bullish lean"
+                action = ("CALLS half size on VWAP hold. "
+                          "Wait for second candle to confirm before adding.")
+        else:
+            ctype  = "UNCLEAR"
+            cemoji = "❓"
+            cread  = "Mixed candle — no clean read"
+            action = "WAIT for 3-5 candles before entering."
+
+        # ── VWAP POSITION ────────────────────────
+        if vwap:
+            if c_ > vwap * 1.001:
+                vwap_pos  = "ABOVE"
+                vwap_note = f"${round(c_ - vwap, 2)} above VWAP"
+            elif c_ < vwap * 0.999:
+                vwap_pos  = "BELOW"
+                vwap_note = f"${round(vwap - c_, 2)} below VWAP"
+            else:
+                vwap_pos  = "AT"
+                vwap_note = "Pinned at VWAP — no direction yet"
+        else:
+            vwap_pos  = "UNKNOWN"
+            vwap_note = "VWAP unavailable"
+
+        # ── CONFLUENCE WITH PRE-MARKET THESIS ────
+        pre_bear = (
+            regime in ["BEARISH_HEDGE_BUILD", "HEDGE_UNWIND_EARLY"] or
+            gap_type in ["FULL_FADE", "FADE_THEN_STATIC"]
+        )
+        pre_bull = (
+            regime in ["HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM"] or
+            gap_type == "DIRECTIONAL"
+        )
+        bear_candle = ctype in ("STRONG_BEAR", "REJECTION_WICK_TOP", "MODERATE_BEAR")
+        bull_candle = ctype in ("STRONG_BULL", "REJECTION_WICK_BOTTOM", "MODERATE_BULL")
+
+        if (pre_bear and bear_candle) or (pre_bull and bull_candle):
+            confluence = "CONFIRMED"
+            conf_emoji = "🚨" if ctype in ("STRONG_BEAR","STRONG_BULL") else "✅"
+            conf_note  = ("Pre-market thesis + candle structure ALIGNED.\n"
+                         "Two independent signals agree. This is the entry.")
+        elif ctype == "DOJI":
+            confluence = "WAIT"
+            conf_emoji = "⏳"
+            conf_note  = "Candle indecision — pre-market thesis unconfirmed. Watch next candle."
+        elif (pre_bear and bull_candle) or (pre_bull and bear_candle):
+            confluence = "CONFLICT"
+            conf_emoji = "⚠️"
+            conf_note  = ("Candle CONTRADICTS pre-market thesis.\n"
+                         "Do NOT enter. Something shifted at open. Reassess.")
+        else:
+            confluence = "NEUTRAL"
+            conf_emoji = "➖"
+            conf_note  = "No strong confluence. Wait for direction to develop."
+
+        # ── VOLUME READ ──────────────────────────
+        if vol_ratio >= 2.0:
+            vol_tag = "🔥 SURGE"
+        elif vol_surge:
+            vol_tag = "✅ ELEVATED"
+        elif vol_ratio < 0.7:
+            vol_tag = "🔇 LIGHT — conviction lacking"
+        else:
+            vol_tag = "⚪ AVERAGE"
+
+        # ── SAVE TO STATE ────────────────────────
+        state["open_candle_type"]       = ctype
+        state["open_candle_body_pct"]   = body_pct
+        state["open_candle_upper_wick"] = upper_pct
+        state["open_candle_lower_wick"] = lower_pct
+        state["open_candle_vol_ratio"]  = vol_ratio
+        state["open_candle_vwap_pos"]   = vwap_pos
+        state["open_candle_confluence"] = confluence
+        state["open_candle_analyzed"]   = True
+
+        # ── ALERT ────────────────────────────────
+        alert(
+            f"{cemoji} OPEN CANDLE — SPY\n"
+            f"{'─'*35}\n"
+            f"{now_str} PDT | First 5-min candle closed\n\n"
+            f"Type: {ctype}\n"
+            f"Body: {body_pct}% | "
+            f"Upper wick: {upper_pct}% | "
+            f"Lower wick: {lower_pct}%\n"
+            f"Volume: {vol_ratio}x average — {vol_tag}\n"
+            f"VWAP: {vwap_pos} ({vwap_note})\n\n"
+            f"{cread}\n\n"
+            f"{conf_emoji} CONFLUENCE: {confluence}\n"
+            f"{conf_note}\n\n"
+            f"{'─'*20}\n"
+            f"📌 ACTION: {action}\n\n"
+            f"Pre-market context:\n"
+            f"Gap: {gap_type} | Regime: {regime} | Score: {conv}/100"
+        )
+
+        print(f"🕯️ Open candle: {ctype} | {confluence} | "
+              f"Body:{body_pct}% | Vol:{vol_ratio}x | VWAP:{vwap_pos}")
+
+    except Exception as e:
+        print(f"Open candle error: {e}")
+
+
 def midnight_reset():
     pdt = now_pdt()
     if pdt.hour == 0 and pdt.minute < 1:
@@ -2755,6 +3759,39 @@ def midnight_reset():
         state["gap_type"]               = "UNKNOWN"
         state["gap_conviction"]         = 0
         state["open_vol_gex_snapshot"]  = None
+        state["open_candle_analyzed"]   = False
+        state["open_candle_type"]       = None
+        state["open_candle_confluence"] = None
+        state["open_candle_body_pct"]   = None
+        state["open_candle_upper_wick"] = None
+        state["open_candle_lower_wick"] = None
+        state["open_candle_vol_ratio"]  = None
+        state["open_candle_vwap_pos"]   = None
+        state["qqq_signal_sent"]          = False
+        state["multi_ticker_signal_sent"] = False
+        state["qqq_last_score"]           = 0
+        state["tsla_last_score"]          = 0
+        state["nvda_last_score"]          = 0
+        state["googl_last_score"]         = 0
+        state["qqq_last_regime"]          = None
+        state["tsla_last_regime"]         = None
+        state["nvda_last_regime"]         = None
+        state["googl_last_regime"]        = None
+        state["qqq_vol_gex_history"]      = []
+        state["tsla_vol_gex_history"]     = []
+        state["nvda_vol_gex_history"]     = []
+        state["googl_vol_gex_history"]    = []
+        state["day_trades_used"]          = 0
+        state["day_trades_warning_sent"]  = False
+        state["spy_liq_zone"]             = None
+        state["qqq_liq_zone"]             = None
+        state["tsla_liq_zone"]            = None
+        state["nvda_liq_zone"]            = None
+        state["googl_liq_zone"]           = None
+        state["cache_status"]             = ""
+        state["cache_levels"]             = ""
+        state["cache_all_levels"]         = ""
+        state["cache_last_updated"]       = 0
         print("🌙 Midnight reset — daily flags cleared")
 
 # ─────────────────────────────────────────────
@@ -2777,6 +3814,7 @@ schedule.every(5).minutes.do(check_consolidation_job)
 schedule.every(5).minutes.do(check_telegram_commands)
 schedule.every(5).minutes.do(check_doji_transition)
 schedule.every(5).minutes.do(check_gamma_wall_approach)
+schedule.every(5).minutes.do(analyze_open_candle)
 schedule.every(5).minutes.do(midnight_reset)
 schedule.every(60).minutes.do(check_heartbeat)
 schedule.every(90).minutes.do(run_overnight_check)
@@ -2784,38 +3822,16 @@ schedule.every(90).minutes.do(run_overnight_check)
 # ─────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────
-print("SPY GAMMABOT v5.1 — FULL ML + OVERNIGHT + NEW MODULES")
+print("SPY GAMMABOT v5.2 — MULTI-TICKER + PDT TRACKER")
 print("=" * 60)
-print("Daytime:")
-print("  1-11. GEX, Regime, Vanna/Charm, Unwind, VIX, TICK, Scorer")
-print("  12. Claude AI Verification + Alert Writer")
-print("  13. Heartbeat Watchdog (60min)")
-print("  14. Doji Transition Detector")
-print("  15. Gamma Wall / TP Alert")
+print("Core: SPY GEX, Regime, Vanna/Charm, Unwind, VIX, TICK")
+print("AI:   Claude verification + alert writing")
 print("NEW:")
-print("  16. OPEX Cycle Phase Awareness")
-print("  17. Futures Pre-Market Check")
-print("  18. Gap Fill Detector")
-print("  19. Vol GEX Velocity Dedicated Alert")
-print("Overnight:")
-print("  20. ES Futures Tracker")
-print("  21. VIX Overnight Monitor")
-print("  22. Overnight Claude Writer")
-print("  23. /overnight Telegram Command")
-print("Persistence:")
-print("  24. GitHub REST API Push (no git binary)")
-print("  25. Startup CSV Pull + Merge")
-print("  26. Historical Context → Claude Morning Brief")
-print("Bugs Fixed:")
-print("  ✅ Telegram offset (no more spam loop)")
-print("  ✅ News fetched before AI verify (fresh data)")
-print("  ✅ Duplicate state key removed")
-print("  ✅ Orphaned docstring removed")
-print("  ✅ OPEX_DATES defined before use")
-print("  ✅ EOD fires exactly once per day")
-print("=" * 60)
-print("Timezone: PDT (UTC-7) | Schedule: 6am-1pm PDT")
-print("Commands: /status /notes /overnight")
+print("  27. QQQ Secondary Signal (fires when SPY is D/F)")
+print("  28. PDT Trade Counter (3-trade limit tracking)")
+print("  29. Open Candle Analysis (6:35am first candle)")
+print("  30. Gap Classification Engine (6 gap types)")
+print("Commands: /status /notes /overnight /pdt /trade /qqq")
 print("=" * 60)
 print()
 if not GITHUB_TOKEN:
