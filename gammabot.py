@@ -88,7 +88,9 @@ def is_overnight_window():
 # ─────────────────────────────────────────────
 # LOGGING SYSTEM v3 — Full ML Dataset
 # ─────────────────────────────────────────────
-LOG_FILE = "spy_gex_log.csv"
+LOG_FILE    = "spy_gex_log.csv"
+TRADE_LOG   = "trade_log.csv"       # one row per actual trade taken
+REPORT_FILE = "daily_reports.txt"   # append-only diary Claude reads back
 LOG_HEADERS = [
     "date", "time", "price",
     "oi_gex_raw", "vol_gex_raw",
@@ -129,6 +131,29 @@ LOG_HEADERS = [
     "open_candle_vwap_pos",    # ABOVE / BELOW / AT
     "open_candle_confluence",  # CONFIRMED / CONFLICT / WAIT / NEUTRAL
     "notes"
+]
+
+# Trade log — one row per actual trade taken
+# Written by /trade command, read by /report and load_historical_context
+TRADE_LOG_HEADERS = [
+    "date", "time",
+    "ticker",           # SPY / QQQ / TSLA / NVDA / GOOGL
+    "direction",        # PUT / CALL
+    "strike",           # option strike price
+    "expiry",           # 0DTE / 1DTE
+    "contracts",        # number of contracts
+    "entry_price",      # premium paid per contract
+    "exit_price",       # premium received per contract
+    "pnl_pct",          # (exit-entry)/entry * 100
+    "pnl_dollars",      # (exit-entry) * contracts * 100
+    "entry_spy_price",  # SPY spot at entry
+    "exit_spy_price",   # SPY spot at exit
+    "regime_at_entry",  # bot regime when trade entered
+    "grade_at_entry",   # bot grade (A+/B+/C/D/F)
+    "candle_confluence",# CONFIRMED / CONFLICT / WAIT / NEUTRAL
+    "gap_type",         # gap classification that morning
+    "outcome",          # WIN / LOSS / BREAKEVEN
+    "notes",            # free text from /trade command
 ]
 
 # ─────────────────────────────────────────────
@@ -272,6 +297,11 @@ state = {
     "cache_levels":             "",     # /levels — SPY liquidity zones
     "cache_all_levels":         "",     # /levels all — all tickers
     "cache_last_updated":       0,
+    # Trade journal — populated by /trade, read by /report
+    "today_trades":             [],     # list of trade dicts logged today
+    "today_outcome_set":        False,  # True once /outcome called today
+    "github_trade_sha":         "",     # SHA for trade_log.csv on GitHub
+    "github_report_sha":        "",     # SHA for daily_reports.txt on GitHub
 }
 
 # ─────────────────────────────────────────────
@@ -385,11 +415,178 @@ def git_commit_log(reason="scheduled"):
     except Exception as e:
         print(f"GitHub push error (data safe locally): {e}")
 
+def git_push_file(filepath, content_bytes, sha_key, commit_msg):
+    """
+    Generic GitHub file push — works for any file.
+    Used for trade_log.csv and daily_reports.txt.
+    Returns new SHA or empty string on failure.
+    """
+    if not _gh_available():
+        return ""
+    try:
+        encoded = base64.b64encode(content_bytes).decode("utf-8")
+        sha = state.get(sha_key, "")
+        filename = os.path.basename(filepath)
+        if not sha:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+            r = requests.get(url, headers=_gh_headers(), timeout=10)
+            if r.status_code == 200:
+                sha = r.json().get("sha", "")
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
+        payload = {"message": commit_msg, "content": encoded, "branch": "main"}
+        if sha:
+            payload["sha"] = sha
+        resp = requests.put(url, headers=_gh_headers(), json=payload, timeout=20)
+        if resp.status_code in (200, 201):
+            new_sha = resp.json().get("content", {}).get("sha", "")
+            if new_sha:
+                state[sha_key] = new_sha
+            print(f"✅ {filename} pushed to GitHub")
+            return new_sha
+        else:
+            print(f"⚠️ GitHub push {filename} failed {resp.status_code}: {resp.text[:60]}")
+            return ""
+    except Exception as e:
+        print(f"git_push_file error ({filepath}): {e}")
+        return ""
+
+
+def init_trade_log():
+    """Create trade_log.csv if it doesn't exist. Pull from GitHub if available."""
+    try:
+        if not os.path.exists(TRADE_LOG):
+            # Try pulling from GitHub first
+            if _gh_available():
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{TRADE_LOG}"
+                r = requests.get(url, headers=_gh_headers(), timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    state["github_trade_sha"] = data.get("sha", "")
+                    raw = base64.b64decode(data["content"]).decode("utf-8")
+                    with open(TRADE_LOG, "w") as f:
+                        f.write(raw)
+                    print(f"✅ trade_log.csv pulled from GitHub")
+                    return
+            # Create fresh
+            with open(TRADE_LOG, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=TRADE_LOG_HEADERS).writeheader()
+            print("📝 trade_log.csv created")
+    except Exception as e:
+        print(f"init_trade_log error: {e}")
+
+
+def append_trade_row(trade_dict):
+    """Write one trade to trade_log.csv and push to GitHub."""
+    try:
+        file_exists = os.path.exists(TRADE_LOG)
+        with open(TRADE_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=TRADE_LOG_HEADERS,
+                                    extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(trade_dict)
+        with open(TRADE_LOG, "rb") as f:
+            content = f.read()
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        git_push_file(TRADE_LOG, content, "github_trade_sha",
+                      f"Trade log [{today_str}]: {trade_dict.get('ticker','')} "
+                      f"{trade_dict.get('direction','')} {trade_dict.get('outcome','')}")
+    except Exception as e:
+        print(f"append_trade_row error: {e}")
+
+
+def append_daily_report(report_text):
+    """Append today's report to daily_reports.txt and push to GitHub."""
+    try:
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        separator = f"\n{'='*60}\n{today_str}\n{'='*60}\n"
+        entry = separator + report_text + "\n"
+        with open(REPORT_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+        with open(REPORT_FILE, "rb") as f:
+            content = f.read()
+        git_push_file(REPORT_FILE, content, "github_report_sha",
+                      f"Daily report [{today_str}]")
+    except Exception as e:
+        print(f"append_daily_report error: {e}")
+
+
+def load_trade_context(days=30):
+    """
+    Loads trade_log.csv and daily_reports.txt into a compact
+    summary for Claude. Used by /report and morning brief.
+    Returns structured text Claude can reason from.
+    """
+    try:
+        trade_lines = []
+        if os.path.exists(TRADE_LOG):
+            with open(TRADE_LOG, "r", newline="") as f:
+                rows = list(csv.DictReader(f))
+            cutoff = (now_pdt() - timedelta(days=days)).strftime("%Y-%m-%d")
+            recent = [r for r in rows if r.get("date", "") >= cutoff]
+            if recent:
+                wins   = sum(1 for r in recent if r.get("outcome") == "WIN")
+                losses = sum(1 for r in recent if r.get("outcome") == "LOSS")
+                total  = len(recent)
+                wr     = round(wins / total * 100, 1) if total > 0 else 0
+                # Average P&L
+                pnls = []
+                for r in recent:
+                    try: pnls.append(float(r.get("pnl_pct", 0) or 0))
+                    except: pass
+                avg_pnl = round(sum(pnls) / len(pnls), 1) if pnls else 0
+                trade_lines.append(
+                    f"TRADE JOURNAL ({days}d): {total} trades | "
+                    f"Win rate: {wr}% | Avg gain: {avg_pnl}%"
+                )
+                # Best setups
+                wins_data = [r for r in recent if r.get("outcome") == "WIN"]
+                for r in sorted(wins_data,
+                                key=lambda x: float(x.get("pnl_pct",0) or 0),
+                                reverse=True)[:3]:
+                    trade_lines.append(
+                        f"  WIN: {r.get('date')} {r.get('ticker')} "
+                        f"{r.get('direction')} | Grade:{r.get('grade_at_entry')} | "
+                        f"Regime:{r.get('regime_at_entry')} | "
+                        f"+{r.get('pnl_pct','?')}% | "
+                        f"Confluence:{r.get('candle_confluence','?')}"
+                    )
+                # Recent losses
+                loss_data = [r for r in recent if r.get("outcome") == "LOSS"]
+                for r in loss_data[-2:]:
+                    trade_lines.append(
+                        f"  LOSS: {r.get('date')} {r.get('ticker')} "
+                        f"{r.get('direction')} | Grade:{r.get('grade_at_entry')} | "
+                        f"Regime:{r.get('regime_at_entry')} | "
+                        f"{r.get('pnl_pct','?')}%"
+                    )
+
+        report_lines = []
+        if os.path.exists(REPORT_FILE):
+            with open(REPORT_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+            # Get last 3 reports
+            sections = content.strip().split("=" * 60)
+            recent_sections = [s.strip() for s in sections if s.strip()][-6:]
+            if recent_sections:
+                report_lines.append("RECENT DAILY REPORTS:")
+                report_lines.extend(recent_sections[-3:])
+
+        result = "\n".join(trade_lines)
+        if report_lines:
+            result += "\n\n" + "\n".join(report_lines)
+        return result if result else "No trade journal data yet."
+    except Exception as e:
+        print(f"load_trade_context error: {e}")
+        return "Trade context unavailable."
+
+
 def init_log():
     """Startup: restore from GitHub, seed session data."""
     print("─" * 60)
     print("STARTUP: Initializing persistent storage...")
     pull_csv_from_github()
+    init_trade_log()
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
@@ -478,7 +675,8 @@ def load_historical_context(days=30):
             f"  Win rate: {win_rate}% (Correct:{correct} Partial:{partial} Wrong:{wrong})\n"
             f"  Macro override YES: {ovr_rate}% win rate ({len(override_rows)} signals)\n"
             f"\nREGIME WIN RATES:\n" + "\n".join(regime_lines) +
-            f"\n\nRECENT SIGNALS:\n" + "\n".join(recent_lines)
+            f"\n\nRECENT SIGNALS:\n" + "\n".join(recent_lines) +
+            f"\n\n" + load_trade_context(days=days)
         )
     except Exception as e:
         print(f"Historical context error: {e}")
@@ -2757,13 +2955,15 @@ def run_job():
                 state[k] = None
             for k in ["regime_transitions_today","vwap_breaks_today"]:
                 state[k] = 0
-            state["last_logged_row"] = {}
-            state["gap_type"]        = "UNKNOWN"
-            state["gap_conviction"]  = 0
-            state["cache_status"]    = ""
-            state["cache_levels"]    = ""
-            state["cache_all_levels"]= ""
-            state["cache_last_updated"] = 0
+            state["last_logged_row"]   = {}
+            state["gap_type"]          = "UNKNOWN"
+            state["gap_conviction"]    = 0
+            state["cache_status"]      = ""
+            state["cache_levels"]      = ""
+            state["cache_all_levels"]  = ""
+            state["cache_last_updated"]= 0
+            state["today_trades"]      = []
+            state["today_outcome_set"] = False
         # Update state
         state["previous_gex_state"] = gex_state
         state["previous_ratio"]     = ratio
@@ -2848,16 +3048,8 @@ async def handle_telegram_updates():
                 continue
 
             # ── /trade — log a day trade, instant ─────────────────────────
-            if text == "/trade":
-                used  = state.get("day_trades_used", 0) + 1
-                state["day_trades_used"] = used
-                left  = MAX_DAY_TRADES - used
-                msg   = f"✅ Trade logged: {used}/{MAX_DAY_TRADES} — {left} left\n"
-                msg  += ("🚫 PDT limit. 1DTE entries only." if left <= 0
-                         else "⚠️ One trade left — best signal only." if left == 1
-                         else f"{left} remaining.")
-                await bot.send_message(chat_id=CHAT_ID, text=msg)
-                continue
+            # NOTE: Full /trade command with trade logging is below.
+            # The old PDT-only handler has been removed.
 
             # ── /tickers /qqq — instant from state ────────────────────────
             if text in ("/qqq", "/tickers"):
@@ -2931,6 +3123,280 @@ async def handle_telegram_updates():
                 await bot.send_message(chat_id=CHAT_ID, text=(
                     f"✅ Note saved to {updated} rows: {note}"))
                 git_commit_log(reason="notes")
+                continue
+
+            # ── /trade — log a real trade outcome ─────────────────────────
+            # Usage: /trade SPY P 684 2.40 8.10 3 0DTE [optional note]
+            # Fields: ticker direction strike entry exit contracts expiry [note]
+            # Example: /trade SPY P 684 2.40 8.10 3 0DTE gap fade worked
+            if text.startswith("/trade"):
+                parts = text.split(maxsplit=8)
+                # Must have at least 8 parts: /trade ticker dir strike entry exit qty expiry
+                if len(parts) < 8:
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        "📝 TRADE LOG\n\n"
+                        "Usage:\n"
+                        "/trade [ticker] [P/C] [strike] [entry$] [exit$] [qty] [0DTE/1DTE] [note]\n\n"
+                        "Example:\n"
+                        "/trade SPY P 684 2.40 8.10 3 0DTE gap faded as predicted\n\n"
+                        "Fields:\n"
+                        "  ticker  — SPY, QQQ, TSLA, NVDA, GOOGL\n"
+                        "  P/C     — PUT or CALL\n"
+                        "  strike  — option strike price\n"
+                        "  entry$  — premium paid per contract\n"
+                        "  exit$   — premium received per contract\n"
+                        "  qty     — number of contracts\n"
+                        "  expiry  — 0DTE or 1DTE\n"
+                        "  note    — optional free text"
+                    ))
+                    continue
+                try:
+                    ticker_t   = parts[1].upper()
+                    direction  = "PUT"  if parts[2].upper() in ("P","PUT")  else "CALL"
+                    strike     = float(parts[3])
+                    entry_px   = float(parts[4])
+                    exit_px    = float(parts[5])
+                    contracts  = int(parts[6])
+                    expiry     = parts[7].upper()
+                    trade_note = parts[8] if len(parts) > 8 else ""
+
+                    pnl_pct    = round((exit_px - entry_px) / entry_px * 100, 1)
+                    pnl_dollars= round((exit_px - entry_px) * contracts * 100, 2)
+                    outcome    = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < -10 else "BREAKEVEN"
+
+                    now_t  = now_pdt()
+                    trade  = {
+                        "date":              now_t.strftime("%Y-%m-%d"),
+                        "time":              now_t.strftime("%H:%M"),
+                        "ticker":            ticker_t,
+                        "direction":         direction,
+                        "strike":            strike,
+                        "expiry":            expiry,
+                        "contracts":         contracts,
+                        "entry_price":       entry_px,
+                        "exit_price":        exit_px,
+                        "pnl_pct":           pnl_pct,
+                        "pnl_dollars":       pnl_dollars,
+                        "entry_spy_price":   "",
+                        "exit_spy_price":    state.get("session_vwap") or "",
+                        "regime_at_entry":   state.get("regime") or "",
+                        "grade_at_entry":    (state.get("last_conviction_score") or ""),
+                        "candle_confluence": state.get("open_candle_confluence") or "",
+                        "gap_type":          state.get("gap_type") or "",
+                        "outcome":           outcome,
+                        "notes":             trade_note,
+                    }
+                    # Save to state for /report
+                    state["today_trades"].append(trade)
+                    # Write to CSV + push GitHub
+                    append_trade_row(trade)
+                    # Increment PDT counter
+                    state["day_trades_used"] = state.get("day_trades_used", 0) + 1
+                    left = MAX_DAY_TRADES - state["day_trades_used"]
+
+                    outcome_emoji = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "➖"
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"{outcome_emoji} TRADE LOGGED\n"
+                        f"{'─'*30}\n"
+                        f"{ticker_t} {direction} ${strike:.0f} | {expiry}\n"
+                        f"Entry: ${entry_px:.2f} → Exit: ${exit_px:.2f}\n"
+                        f"Contracts: {contracts}\n\n"
+                        f"P&L: {'+' if pnl_pct>0 else ''}{pnl_pct}% "
+                        f"(${'+' if pnl_dollars>0 else ''}{pnl_dollars:.0f})\n"
+                        f"Outcome: {outcome}\n\n"
+                        f"Regime: {trade['regime_at_entry'] or '—'}\n"
+                        f"Confluence: {trade['candle_confluence'] or '—'}\n"
+                        f"Gap: {trade['gap_type'] or '—'}\n\n"
+                        f"PDT: {state['day_trades_used']}/{MAX_DAY_TRADES} "
+                        f"({left} left)\n"
+                        f"Saved to trade_log.csv ✅"
+                        + (f"\nNote: {trade_note}" if trade_note else "")
+                    ))
+                except (ValueError, IndexError) as e:
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"⚠️ Could not parse trade: {e}\n\n"
+                        "Format: /trade SPY P 684 2.40 8.10 3 0DTE [note]"
+                    ))
+                continue
+
+            # ── /outcome — close today's signal with a verdict ────────────
+            # Usage: /outcome correct [notes]
+            #        /outcome wrong   [notes]
+            #        /outcome partial [notes]
+            if text.startswith("/outcome"):
+                parts    = text.split(maxsplit=2)
+                if len(parts) < 2:
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        "📋 OUTCOME\n\n"
+                        "Usage:\n"
+                        "/outcome correct  — signal was right\n"
+                        "/outcome wrong    — signal was wrong\n"
+                        "/outcome partial  — partially right\n\n"
+                        "Add notes:\n"
+                        "/outcome correct gap faded exactly to vanna target"
+                    ))
+                    continue
+                verdict_raw = parts[1].lower().strip()
+                outcome_note= parts[2] if len(parts) > 2 else ""
+                verdict_map = {
+                    "correct": "YES", "right": "YES", "yes": "YES", "win": "YES",
+                    "wrong":   "NO",  "no":    "NO",  "loss": "NO",
+                    "partial": "PARTIAL", "ok": "PARTIAL", "mixed": "PARTIAL",
+                }
+                signal_correct = verdict_map.get(verdict_raw, "PARTIAL")
+
+                # Update all of today's market rows in CSV
+                if not os.path.exists(LOG_FILE):
+                    await bot.send_message(chat_id=CHAT_ID,
+                        text="⚠️ No log file yet.")
+                    continue
+                with open(LOG_FILE, "r", newline="") as f:
+                    rows = list(csv.DictReader(f))
+                updated = 0
+                for row in rows:
+                    if (row.get("date") == today_str and
+                            row.get("session_type", "MARKET") == "MARKET"):
+                        row["signal_correct"] = signal_correct
+                        if outcome_note:
+                            existing = row.get("notes", "")
+                            row["notes"] = (existing + " | " + outcome_note
+                                            if existing else outcome_note)
+                        updated += 1
+                with open(LOG_FILE, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=LOG_HEADERS,
+                                            extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                state["today_outcome_set"] = True
+                git_commit_log(reason="outcome")
+
+                verdict_emoji = {"YES": "✅", "NO": "❌", "PARTIAL": "⚠️"}
+                await bot.send_message(chat_id=CHAT_ID, text=(
+                    f"{verdict_emoji.get(signal_correct,'➖')} OUTCOME LOGGED\n"
+                    f"{'─'*30}\n"
+                    f"Signal correct: {signal_correct}\n"
+                    f"Updated: {updated} rows\n"
+                    + (f"Note: {outcome_note}\n" if outcome_note else "") +
+                    f"\nThis feeds into tomorrow's morning brief.\n"
+                    f"Run /report for today's full summary."
+                ))
+                continue
+
+            # ── /report — Claude writes today's full summary ──────────────
+            # Pulls everything: bot calls, candle read, your trades, outcome.
+            # Saves to daily_reports.txt on GitHub.
+            # Claude reads this back in future morning briefs.
+            if text == "/report":
+                now_s = now_pdt().strftime("%H:%M")
+                await bot.send_message(chat_id=CHAT_ID,
+                    text=f"📝 Writing today's report at {now_s} PDT...")
+                try:
+                    # Build full context for Claude
+                    today_str_r = now_pdt().strftime("%Y-%m-%d")
+                    trades      = state.get("today_trades", [])
+                    trade_block = ""
+                    if trades:
+                        tlines = []
+                        for t in trades:
+                            tlines.append(
+                                f"  {t['ticker']} {t['direction']} "
+                                f"${t['strike']:.0f} | "
+                                f"Entry ${t['entry_price']} → "
+                                f"Exit ${t['exit_price']} | "
+                                f"{'+' if float(t['pnl_pct'])>0 else ''}"
+                                f"{t['pnl_pct']}% | {t['outcome']}"
+                                + (f" | {t['notes']}" if t.get('notes') else "")
+                            )
+                        trade_block = "TODAY'S TRADES:\n" + "\n".join(tlines)
+                    else:
+                        trade_block = "TODAY'S TRADES: None logged"
+
+                    # Bot signal context
+                    regime    = state.get("regime", "UNKNOWN")
+                    score     = state.get("last_conviction_score", 0)
+                    grade     = "A+" if score>=80 else "B+" if score>=65 else \
+                                "C"  if score>=50 else "D"  if score>=35 else "F"
+                    candle    = state.get("open_candle_type") or "Not recorded"
+                    confluence= state.get("open_candle_confluence") or "Not recorded"
+                    gap_t     = state.get("gap_type") or "UNKNOWN"
+                    gap_conv  = state.get("gap_conviction") or 0
+                    vt        = state.get("current_vanna_target")
+                    outcome_s = "UNKNOWN"
+                    # Try reading from CSV
+                    try:
+                        with open(LOG_FILE, "r", newline="") as f:
+                            all_r = list(csv.DictReader(f))
+                        today_r = [r for r in all_r
+                                   if r.get("date") == today_str_r
+                                   and r.get("session_type","MARKET") == "MARKET"]
+                        if today_r:
+                            outcome_s = today_r[-1].get("signal_correct", "UNKNOWN")
+                    except Exception:
+                        pass
+
+                    hist = load_historical_context(days=30)
+
+                    report_context = (
+                        f"Date: {today_str_r}\n"
+                        f"Bot signal: {grade} ({score}/100) | {regime}\n"
+                        f"Gap: {gap_t} ({gap_conv}% conviction)\n"
+                        f"Open candle: {candle} | Confluence: {confluence}\n"
+                        f"Vanna target: ${vt:.2f}\n" if vt else
+                        "Vanna target: None\n"
+                    ) + (
+                        f"Signal outcome: {outcome_s}\n\n"
+                        f"{trade_block}\n\n"
+                        f"{hist}"
+                    )
+
+                    if anthropic_client:
+                        prompt = (
+                            f"You are writing a daily trade journal entry for a "
+                            f"SPY 0DTE/1DTE options trader in California.\n\n"
+                            f"TODAY'S DATA:\n{report_context}\n\n"
+                            f"Write a concise daily report (max 15 lines) covering:\n"
+                            f"1. What the bot called today and why\n"
+                            f"2. What actually happened in the market\n"
+                            f"3. Were the trades correct? What worked or didn't?\n"
+                            f"4. One key pattern or lesson from today\n"
+                            f"5. One sentence on what to watch tomorrow\n\n"
+                            f"Be direct and honest. If a trade was wrong, say so.\n"
+                            f"Reference specific numbers (GEX, score, P&L).\n"
+                            f"Plain English. No jargon. 1-2 emojis max.\n"
+                            f"This will be read by Claude tomorrow morning for context."
+                        )
+                        resp = anthropic_client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=800,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+                        report_text = resp.content[0].text.strip()
+                    else:
+                        # Fallback without Claude
+                        win_c  = sum(1 for t in trades if t.get("outcome") == "WIN")
+                        loss_c = sum(1 for t in trades if t.get("outcome") == "LOSS")
+                        report_text = (
+                            f"Bot: {grade} ({score}/100) | {regime}\n"
+                            f"Gap: {gap_t} | Candle: {candle} | {confluence}\n"
+                            f"Signal: {outcome_s}\n"
+                            f"Trades: {len(trades)} total | "
+                            f"{win_c} wins | {loss_c} losses"
+                        )
+
+                    # Save to daily_reports.txt + push GitHub
+                    append_daily_report(report_text)
+
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"📝 DAILY REPORT — {today_str_r}\n"
+                        f"{'─'*35}\n\n"
+                        f"{report_text}\n\n"
+                        f"{'─'*20}\n"
+                        f"Saved to daily_reports.txt ✅\n"
+                        f"Claude will reference this tomorrow."
+                    ))
+                except Exception as re:
+                    await bot.send_message(chat_id=CHAT_ID,
+                        text=f"⚠️ Report error: {re}")
                 continue
 
     except Exception as e:
@@ -3180,6 +3646,13 @@ def rebuild_command_cache(price, gex_state, regime, conv, grade,
             gc = g.split()[0] if g and g != "—" else "—"
             return f"{gc} ({s}/100) | {r}"
 
+        trades_today = state.get("today_trades", [])
+        wins_today   = sum(1 for t in trades_today if t.get("outcome") == "WIN")
+        loss_today   = sum(1 for t in trades_today if t.get("outcome") == "LOSS")
+        trade_line   = (f"Trades today: {len(trades_today)} "
+                        f"({wins_today}W/{loss_today}L)"
+                        if trades_today else "Trades today: none logged")
+
         state["cache_status"] = (
             f"📊 STATUS — {now_str} PDT\n"
             f"{'─'*28}\n\n"
@@ -3196,6 +3669,7 @@ def rebuild_command_cache(price, gex_state, regime, conv, grade,
             f"Flow: {flow_dir}\n\n"
             f"PDT: {state.get('day_trades_used',0)}/{MAX_DAY_TRADES} "
             f"({trades_left} left)\n"
+            f"{trade_line}\n"
             f"APIs: UW:{'✅' if UW_TOKEN else '❌'} "
             f"Claude:{'✅' if anthropic_client else '❌'} "
             f"GitHub:{'✅' if GITHUB_TOKEN else '❌'}"
@@ -3792,6 +4266,8 @@ def midnight_reset():
         state["cache_levels"]             = ""
         state["cache_all_levels"]         = ""
         state["cache_last_updated"]       = 0
+        state["today_trades"]             = []
+        state["today_outcome_set"]        = False
         print("🌙 Midnight reset — daily flags cleared")
 
 # ─────────────────────────────────────────────
@@ -3831,7 +4307,7 @@ print("  27. QQQ Secondary Signal (fires when SPY is D/F)")
 print("  28. PDT Trade Counter (3-trade limit tracking)")
 print("  29. Open Candle Analysis (6:35am first candle)")
 print("  30. Gap Classification Engine (6 gap types)")
-print("Commands: /status /notes /overnight /pdt /trade /qqq")
+print("Commands: /status /levels /levels all /tickers /pdt /trade /outcome /report /overnight /notes")
 print("=" * 60)
 print()
 if not GITHUB_TOKEN:
