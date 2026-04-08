@@ -19,12 +19,12 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # ENVIRONMENT VARIABLES
 # ─────────────────────────────────────────────
-UW_TOKEN         = os.getenv("UW_TOKEN")
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID          = int(os.getenv("CHAT_ID", "0"))
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-GITHUB_TOKEN     = os.getenv("GITHUB_TOKEN", "")
-GITHUB_REPO      = os.getenv("GITHUB_REPO", "coding101010rizz/trading-bots")
+UW_TOKEN          = (os.getenv("UW_TOKEN") or "").strip()
+TELEGRAM_TOKEN    = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+CHAT_ID           = int((os.getenv("CHAT_ID") or "0").strip())
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+GITHUB_TOKEN      = (os.getenv("GITHUB_TOKEN") or "").strip()
+GITHUB_REPO       = (os.getenv("GITHUB_REPO") or "coding101010rizz/trading-bots").strip()
 TICKER           = "SPY"
 
 # ─────────────────────────────────────────────
