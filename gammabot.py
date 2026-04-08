@@ -130,6 +130,11 @@ LOG_HEADERS = [
     "open_candle_vol_ratio",   # volume vs 10-candle average (e.g. 2.3 = 2.3x)
     "open_candle_vwap_pos",    # ABOVE / BELOW / AT
     "open_candle_confluence",  # CONFIRMED / CONFLICT / WAIT / NEUTRAL
+    # Suspicious flow + hedge logger — auto-populated every reading
+    "flow_flag_score",      # highest flow score seen this reading (0-100)
+    "flow_classification",  # NONE/SILENT/WATCH/HIGH_CONVICTION
+    "flow_contract",        # flagged contract e.g. "SPY 676C"
+    "hedge_score",          # hedge activity score this reading (0-100)
     "notes"
 ]
 
@@ -154,6 +159,35 @@ TRADE_LOG_HEADERS = [
     "gap_type",         # gap classification that morning
     "outcome",          # WIN / LOSS / BREAKEVEN
     "notes",            # free text from /trade command
+]
+# ─────────────────────────────────────────────
+# SUSPICIOUS FLOW LOG
+# One row per flagged options flow event.
+# Written by check_suspicious_flow() every 5min
+# and by /flag manual command.
+# next_day_move filled by EOD autofill next morning.
+# ─────────────────────────────────────────────
+SUSPICIOUS_FLOW_FILE = "suspicious_flows.csv"
+SUSPICIOUS_FLOW_HEADERS = [
+    "date",             # date flagged
+    "time",             # time flagged (PDT)
+    "ticker",           # SPY / QQQ / TSLA etc
+    "contract",         # e.g. "SPY 676C" or "SPY 652P"
+    "expiry_days",      # days until expiration
+    "volume",           # contracts traded
+    "notional",         # estimated dollar value
+    "execution",        # SWEEP / ASCENDING / DESCENDING / BLOCK
+    "flag_score",       # 0-100 composite suspicion score
+    "flag_reasons",     # pipe-separated list of triggered factors
+    "regime_at_time",   # bot regime when flagged
+    "spy_price",        # SPY spot at time of flag
+    "vix_at_time",      # VIX when flagged
+    "classification",   # WATCH / HIGH_CONVICTION / SILENT
+    "claude_note",      # Claude plain English interpretation
+    "next_day_move",    # SPY point move next session (EOD autofill)
+    "outcome_correct",  # YES/NO/UNKNOWN — was flow predictive?
+    "manual_flag",      # YES if added via /flag command
+    "notes",            # free text
 ]
 
 # ─────────────────────────────────────────────
@@ -302,6 +336,19 @@ state = {
     "today_outcome_set":        False,  # True once /outcome called today
     "github_trade_sha":         "",     # SHA for trade_log.csv on GitHub
     "github_report_sha":        "",     # SHA for daily_reports.txt on GitHub
+    # Suspicious flow tracking
+    "github_flow_sha":          "",     # SHA for suspicious_flows.csv
+    "last_flow_check_time":     0,      # last time we checked flow
+    "flow_alerts_sent_today":   [],     # list of contract keys flagged today
+    "flow_silent_log_today":    [],     # silent logs (score 40-59)
+    # Current flow/hedge state — updated every 5min by check_suspicious_flow
+    "current_flow_score":       0,
+    "current_flow_classification": "NONE",
+    "current_flow_contract":    "",
+    "current_hedge_score":      0,
+    "hedge_alert_sent_today":   [],     # dedup for hedge alerts
+    # Put/call ratio history for spike detection (5-day rolling)
+    "put_call_ratio_history":   [],
 }
 
 # ─────────────────────────────────────────────
@@ -587,6 +634,7 @@ def init_log():
     print("STARTUP: Initializing persistent storage...")
     pull_csv_from_github()
     init_trade_log()
+    init_suspicious_flow_log()
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_HEADERS)
@@ -676,7 +724,9 @@ def load_historical_context(days=30):
             f"  Macro override YES: {ovr_rate}% win rate ({len(override_rows)} signals)\n"
             f"\nREGIME WIN RATES:\n" + "\n".join(regime_lines) +
             f"\n\nRECENT SIGNALS:\n" + "\n".join(recent_lines) +
-            f"\n\n" + load_trade_context(days=days)
+            f"\n\n" + load_trade_context(days=days) +
+            ("\n\n" + load_suspicious_flow_context(days=days)
+             if load_suspicious_flow_context(days=days) else "")
         )
     except Exception as e:
         print(f"Historical context error: {e}")
@@ -2210,6 +2260,13 @@ def log_reading(price, oi_gex, vol_gex, oi_m, vol_m, ratio, gex_state,
             "claude_confidence": claude_confidence,
             "claude_reasoning": claude_reasoning[:500] if claude_reasoning else "",
             "combined_score": combined_score,
+            # Suspicious flow + hedge auto-logger
+            # Updated every 5min by check_suspicious_flow()
+            # Gives every GEX row a snapshot of institutional activity
+            "flow_flag_score":     state.get("current_flow_score", 0) or 0,
+            "flow_classification": state.get("current_flow_classification", "NONE") or "NONE",
+            "flow_contract":       state.get("current_flow_contract", "") or "",
+            "hedge_score":         state.get("current_hedge_score", 0) or 0,
             # Candle fields — populated only on 6:35am row via state,
             # blank on all other rows. Never breaks existing data.
             "open_candle_type":       state.get("open_candle_type") or "",
@@ -2376,6 +2433,10 @@ def eod_autofill(close_price):
                                            "vol": state.get("previous_vol_gex")}
         state["overnight_vol_gex_close"] = state.get("previous_vol_gex")
         git_commit_log(reason="eod")
+        _autofill_suspicious_flow_outcomes(
+            prev_close=state.get("prev_session_close"),
+            today_close=true_close
+        )
         now_str = now_pdt().strftime("%H:%M")
         sig_emoji = "✅" if correct == "YES" else "❌" if correct == "NO" else "⚠️"
         max_up    = round(s_high - open_price, 2)
@@ -2964,6 +3025,13 @@ def run_job():
             state["cache_last_updated"]= 0
             state["today_trades"]      = []
             state["today_outcome_set"] = False
+            state["flow_alerts_sent_today"] = []
+            state["flow_silent_log_today"]  = []
+            state["hedge_alert_sent_today"] = []
+            state["current_flow_score"]          = 0
+            state["current_flow_classification"] = "NONE"
+            state["current_flow_contract"]       = ""
+            state["current_hedge_score"]         = 0
         # Update state
         state["previous_gex_state"] = gex_state
         state["previous_ratio"]     = ratio
@@ -3286,6 +3354,81 @@ async def handle_telegram_updates():
             # Pulls everything: bot calls, candle read, your trades, outcome.
             # Saves to daily_reports.txt on GitHub.
             # Claude reads this back in future morning briefs.
+            # ── /flag — manual suspicious flow entry ──────────────
+            # Usage: /flag [contract] [notional] [note]
+            # Example: /flag 676C 890000 pre-close sweep before Iran news
+            if text.startswith("/flag"):
+                parts = text.split(maxsplit=3)
+                if len(parts) < 3:
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        "🚨 MANUAL FLAG\n\n"
+                        "Usage:\n"
+                        "/flag [contract] [notional] [note]\n\n"
+                        "Example:\n"
+                        "/flag 676C 890000 pre-close sweep before Iran ceasefire news\n\n"
+                        "Fields:\n"
+                        "  contract  — e.g. 676C or 652P\n"
+                        "  notional  — dollar value (e.g. 890000)\n"
+                        "  note      — what you observed"
+                    ))
+                    continue
+                try:
+                    contract_raw = parts[1].upper()
+                    notional_raw = float(parts[2].replace(",","").replace("$","") or 0)
+                    flag_note    = parts[3] if len(parts) > 3 else ""
+                    contract_label = f"SPY {contract_raw}"
+                    now_t     = now_pdt()
+                    today_str2= now_t.strftime("%Y-%m-%d")
+                    now_s2    = now_t.strftime("%H:%M")
+                    vix_now   = state.get("vix_history", [None])[-1]
+                    spy_price = state.get("session_vwap") or ""
+                    flow_row  = {
+                        "date":           today_str2,
+                        "time":           now_s2,
+                        "ticker":         "SPY",
+                        "contract":       contract_label,
+                        "expiry_days":    "",
+                        "volume":         "",
+                        "notional":       int(notional_raw),
+                        "execution":      "MANUAL",
+                        "flag_score":     80,
+                        "flag_reasons":   f"Manual flag by trader | {flag_note}",
+                        "regime_at_time": state.get("regime", ""),
+                        "spy_price":      spy_price,
+                        "vix_at_time":    round(vix_now, 2) if vix_now else "",
+                        "classification": "HIGH_CONVICTION",
+                        "claude_note":    "",
+                        "next_day_move":  "",
+                        "outcome_correct":"UNKNOWN",
+                        "manual_flag":    "YES",
+                        "notes":          flag_note,
+                    }
+                    # Ask Claude to interpret
+                    claude_note = write_flow_alert_with_claude(
+                        flow_row, 80, [f"Manual trader flag: {flag_note}"]
+                    )
+                    if claude_note:
+                        flow_row["claude_note"] = claude_note[:500]
+                    append_suspicious_flow_row(flow_row)
+                    state.setdefault("flow_alerts_sent_today", []).append(
+                        f"{contract_raw}_{today_str2}_MANUAL"
+                    )
+                    await bot.send_message(chat_id=CHAT_ID, text=(
+                        f"🚨 FLOW FLAGGED MANUALLY\n"
+                        f"{'─'*30}\n"
+                        f"Contract: {contract_label}\n"
+                        f"Notional: ${int(notional_raw):,}\n"
+                        f"Regime: {state.get('regime','—')}\n"
+                        + (f"\n💬 {claude_note}" if claude_note else "") +
+                        f"\n\nNote: {flag_note}\n"
+                        f"Saved to suspicious_flows.csv ✅\n"
+                        f"Next-day outcome will auto-fill at EOD tomorrow."
+                    ))
+                except Exception as fe:
+                    await bot.send_message(chat_id=CHAT_ID,
+                        text=f"⚠️ Flag error: {fe}\nFormat: /flag 676C 890000 [note]")
+                continue
+
             if text == "/report":
                 now_s = now_pdt().strftime("%H:%M")
                 await bot.send_message(chat_id=CHAT_ID,
@@ -4268,7 +4411,780 @@ def midnight_reset():
         state["cache_last_updated"]       = 0
         state["today_trades"]             = []
         state["today_outcome_set"]        = False
+        state["flow_alerts_sent_today"]   = []
+        state["flow_silent_log_today"]    = []
+        state["hedge_alert_sent_today"]   = []
+        state["current_flow_score"]            = 0
+        state["current_flow_classification"]   = "NONE"
+        state["current_flow_contract"]         = ""
+        state["current_hedge_score"]           = 0
+        state["put_call_ratio_history"]        = []
         print("🌙 Midnight reset — daily flags cleared")
+
+
+# ─────────────────────────────────────────────
+# MODULE: SUSPICIOUS FLOW DETECTION ENGINE
+# ─────────────────────────────────────────────
+# Scores every options contract 0-100 across
+# 5 factors. Alerts when score >= 60.
+# Silently logs score 40-59. Ignores < 40.
+#
+# FACTOR 1: Expiry urgency     (0-25pts)
+# FACTOR 2: Regime contradiction (0-25pts)
+# FACTOR 3: Session timing     (0-20pts)
+# FACTOR 4: Size anomaly       (0-20pts)
+# FACTOR 5: Execution signature (0-10pts)
+# ─────────────────────────────────────────────
+
+def init_suspicious_flow_log():
+    """Create suspicious_flows.csv if it doesn't exist. Pull from GitHub if available."""
+    try:
+        if not os.path.exists(SUSPICIOUS_FLOW_FILE):
+            if _gh_available():
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{SUSPICIOUS_FLOW_FILE}"
+                r = requests.get(url, headers=_gh_headers(), timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    state["github_flow_sha"] = data.get("sha", "")
+                    raw = base64.b64decode(data["content"]).decode("utf-8")
+                    with open(SUSPICIOUS_FLOW_FILE, "w") as f:
+                        f.write(raw)
+                    print("✅ suspicious_flows.csv pulled from GitHub")
+                    return
+            with open(SUSPICIOUS_FLOW_FILE, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=SUSPICIOUS_FLOW_HEADERS).writeheader()
+            print("📝 suspicious_flows.csv created")
+    except Exception as e:
+        print(f"init_suspicious_flow_log error: {e}")
+
+
+def append_suspicious_flow_row(flow_dict):
+    """Write one flagged flow to suspicious_flows.csv and push to GitHub."""
+    try:
+        file_exists = os.path.exists(SUSPICIOUS_FLOW_FILE)
+        with open(SUSPICIOUS_FLOW_FILE, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SUSPICIOUS_FLOW_HEADERS,
+                                    extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(flow_dict)
+        with open(SUSPICIOUS_FLOW_FILE, "rb") as f:
+            content_bytes = f.read()
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        git_push_file(
+            SUSPICIOUS_FLOW_FILE, content_bytes, "github_flow_sha",
+            f"Suspicious flow [{today_str}]: {flow_dict.get('ticker','')} "
+            f"{flow_dict.get('contract','')} score={flow_dict.get('flag_score','')}"
+        )
+    except Exception as e:
+        print(f"append_suspicious_flow_row error: {e}")
+
+
+def score_suspicious_flow(contract):
+    """
+    Score a single options contract 0-100 for suspicion.
+    Returns (score, reasons_list, classification).
+
+    contract dict keys expected:
+      type, strike, volume, open_interest, execution_estimate,
+      expiration_date (or days_to_expiry), ask, bid, last_price
+    """
+    score = 0
+    reasons = []
+
+    try:
+        ctype   = str(contract.get("type", "")).upper()
+        volume  = float(contract.get("volume", 0) or 0)
+        oi      = float(contract.get("open_interest", 1) or 1)
+        strike  = float(contract.get("strike", 0) or 0)
+        exec_   = str(contract.get("execution_estimate", "")).upper()
+        ask     = float(contract.get("ask", 0) or 0)
+        bid     = float(contract.get("bid", 0) or 0)
+        last_px = float(contract.get("last_price", ask) or ask)
+        is_put  = "PUT" in ctype
+        is_call = "CALL" in ctype
+
+        # Estimate days to expiry
+        days_to_exp = None
+        try:
+            exp_str = str(contract.get("expiration_date", "") or "")
+            if exp_str:
+                exp_date = datetime.strptime(exp_str[:10], "%Y-%m-%d").date()
+                days_to_exp = (exp_date - date.today()).days
+        except Exception:
+            pass
+
+        # Estimated notional value
+        mid_px  = (ask + bid) / 2 if ask and bid else last_px
+        notional = round(volume * mid_px * 100, 0) if mid_px > 0 else 0
+
+        # ── FACTOR 1: Expiry urgency (0-25pts) ──────────────────
+        if days_to_exp is not None:
+            if days_to_exp <= 2:
+                score += 25
+                reasons.append(f"Near-term expiry ({days_to_exp}d) — conviction or catalyst")
+            elif days_to_exp <= 5:
+                score += 15
+                reasons.append(f"Short expiry ({days_to_exp}d) — directional bet")
+            elif days_to_exp <= 14:
+                score += 5
+                reasons.append(f"Medium expiry ({days_to_exp}d) — possible hedge")
+            # 15+ days: 0pts (likely hedging/spread)
+
+        # ── FACTOR 2: Regime contradiction (0-25pts) ─────────────
+        regime = state.get("regime", "UNKNOWN")
+        if regime not in ("UNKNOWN", "INSUFFICIENT_DATA"):
+            bull_regime = regime in ("HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM",
+                                     "HEDGE_UNWIND_EARLY")
+            bear_regime = regime in ("BEARISH_HEDGE_BUILD",)
+            if is_call and bear_regime:
+                score += 25
+                reasons.append(f"CALL sweep in BEARISH regime ({regime}) — contra-institutional")
+            elif is_put and bull_regime:
+                score += 25
+                reasons.append(f"PUT sweep in BULLISH regime ({regime}) — contra-institutional")
+            elif is_call and bull_regime:
+                # Aligned — slightly suspicious only if very large
+                if notional >= 500000:
+                    score += 5
+                    reasons.append(f"Large CALL sweep aligned with bull regime — momentum chasing")
+            elif is_put and bear_regime:
+                if notional >= 500000:
+                    score += 5
+                    reasons.append(f"Large PUT sweep aligned with bear regime — momentum chasing")
+
+        # ── FACTOR 3: Session timing (0-20pts) ──────────────────
+        pdt = now_pdt()
+        h, m = pdt.hour, pdt.minute
+        mins_since_open = (h - 6) * 60 + m - 30
+        mins_to_close   = (13 * 60) - (h * 60 + m)
+
+        if is_market_open():
+            if mins_to_close <= 15:
+                score += 20
+                reasons.append(f"Final 15min sweep ({pdt.strftime('%H:%M')} PDT) — pre-catalyst positioning")
+            elif mins_to_close <= 30:
+                score += 12
+                reasons.append(f"Last 30min sweep — end-of-day institutional positioning")
+            elif mins_since_open <= 15:
+                score += 15
+                reasons.append(f"Opening 15min sweep — immediate directional conviction")
+            elif mins_since_open <= 30:
+                score += 8
+                reasons.append(f"Opening 30min sweep — early session positioning")
+
+        # ── FACTOR 4: Size anomaly (0-20pts) ─────────────────────
+        if notional >= 1_000_000:
+            score += 20
+            reasons.append(f"${round(notional/1e6,1)}M notional — extreme institutional size")
+        elif notional >= 500_000:
+            score += 15
+            reasons.append(f"${round(notional/1e3,0):.0f}K notional — large institutional")
+        elif notional >= 250_000:
+            score += 8
+            reasons.append(f"${round(notional/1e3,0):.0f}K notional — notable size")
+        elif notional >= 100_000:
+            score += 3
+            reasons.append(f"${round(notional/1e3,0):.0f}K notional — medium")
+
+        # ── FACTOR 5: Execution signature (0-10pts) ──────────────
+        if "SWEEP" in exec_:
+            score += 10
+            reasons.append("SWEEP execution — crossed multiple exchanges, urgency buying")
+        elif "ASCENDING" in exec_:
+            score += 8
+            reasons.append("ASCENDING fill — buyer lifting offers aggressively")
+        elif "DESCENDING" in exec_:
+            score += 5
+            reasons.append("DESCENDING fill — seller hitting bids aggressively")
+        elif "BLOCK" in exec_:
+            score += 3
+            reasons.append("BLOCK trade — single large negotiated trade")
+
+        score = min(100, score)
+
+        if score >= 80:
+            classification = "HIGH_CONVICTION"
+        elif score >= 60:
+            classification = "WATCH"
+        elif score >= 40:
+            classification = "SILENT"
+        else:
+            classification = "IGNORE"
+
+        return score, reasons, classification, notional, days_to_exp
+
+    except Exception as e:
+        print(f"score_suspicious_flow error: {e}")
+        return 0, [], "IGNORE", 0, None
+
+
+def write_flow_alert_with_claude(flow_dict, score, reasons):
+    """Claude writes plain English interpretation of suspicious flow."""
+    if not anthropic_client:
+        return None
+    try:
+        regime  = state.get("regime", "UNKNOWN")
+        price   = state.get("session_vwap") or flow_dict.get("spy_price", "?")
+        reasons_text = "\n".join(f"  • {r}" for r in reasons)
+        prompt = f"""You are analyzing suspicious options flow for a SPY 0DTE/1DTE trader.
+
+FLAGGED FLOW:
+  Contract: {flow_dict.get("contract")}
+  Notional: ${float(flow_dict.get("notional", 0)):,.0f}
+  Execution: {flow_dict.get("execution")}
+  Expiry: {flow_dict.get("expiry_days")} days
+  Time: {flow_dict.get("time")} PDT
+  Score: {score}/100 ({flow_dict.get("classification")})
+
+WHY FLAGGED:
+{reasons_text}
+
+MARKET CONTEXT:
+  SPY: ${price} | Regime: {regime}
+  VIX: {flow_dict.get("vix_at_time", "?")}
+
+Write 3-4 sentences maximum. Plain English. No jargon.
+Explain: what this flow suggests, whether it could be hedging or real conviction,
+and what to watch for tomorrow if this is predictive.
+Be honest about uncertainty — most unusual flow has innocent explanations."""
+
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"Flow Claude writer error: {e}")
+        return None
+
+
+def check_suspicious_flow():
+    """
+    Runs every 5 minutes during market hours.
+    Fetches options contracts for SPY and scores each one.
+    Fires alert for score >= 60, silently logs 40-59.
+    Deduplicates: won't re-alert same contract same day.
+    """
+    if not is_market_open():
+        return
+    try:
+        url = f"https://api.unusualwhales.com/api/stock/{TICKER}/options-contracts"
+        headers = {"Authorization": f"Bearer {UW_TOKEN}", "Accept": "application/json"}
+        resp = requests.get(url, headers=headers,
+                            params={"limit": 50, "order": "desc"}, timeout=10)
+        data = resp.json().get("data", [])
+        if not data:
+            return
+
+        now_str   = now_pdt().strftime("%H:%M")
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        alerted_today  = state.get("flow_alerts_sent_today", [])
+        silent_today   = state.get("flow_silent_log_today", [])
+        vix_now = state.get("vix_history", [None])[-1]
+        spy_price_raw = state.get("session_vwap") or 0
+        spy_price = spy_price_raw
+
+        # ── HEDGE ACTIVITY SCORING ───────────────────────────────
+        # Run on every contract batch — separate from suspicious score
+        try:
+            hedge_score, hedge_reasons, hedge_class = score_hedge_activity(
+                data, float(spy_price_raw) if spy_price_raw else 0
+            )
+            state["current_hedge_score"]      = hedge_score
+            # Fire hedge alert if warranted and not already sent today
+            hedge_key = f"HEDGE_{today_str}_{hedge_class}"
+            hedge_alerted = state.get("hedge_alert_sent_today", [])
+            if hedge_class in ("HEDGE_WATCH", "HEDGE_HIGH") and hedge_key not in hedge_alerted:
+                emoji    = "🛡️🚨" if hedge_class == "HEDGE_HIGH" else "🛡️⚠️"
+                h_text   = "\n".join(f"  → {r}" for r in hedge_reasons)
+                cl_note  = ""
+                if hedge_class == "HEDGE_HIGH" and anthropic_client:
+                    try:
+                        h_prompt = (
+                            f"A SPY options trader needs a plain English explanation "
+                            f"of unusual hedge activity detected right now.\n\n"
+                            f"Hedge score: {hedge_score}/100 ({hedge_class})\n"
+                            f"Regime: {state.get('regime','?')} | SPY: ${spy_price}\n"
+                            f"Patterns detected:\n" +
+                            "\n".join(f"  {r}" for r in hedge_reasons) +
+                            f"\n\nIn 3 sentences max: what are institutions doing, "
+                            f"why it matters, and what to watch tomorrow. Plain English."
+                        )
+                        h_resp = anthropic_client.messages.create(
+                            model="claude-sonnet-4-6", max_tokens=250,
+                            messages=[{"role": "user", "content": h_prompt}]
+                        )
+                        cl_note = "\n\n💬 " + h_resp.content[0].text.strip()
+                    except Exception:
+                        pass
+                alert(
+                    f"{emoji} HEDGE ACTIVITY — SPY\n"
+                    f"{'─'*35}\n"
+                    f"{now_str} PDT | Score: {hedge_score}/100\n\n"
+                    f"⚑ PATTERNS:\n{h_text}"
+                    + cl_note +
+                    f"\n\nRegime: {state.get('regime','?')} | "
+                    f"Logged to suspicious_flows.csv"
+                )
+                # Log hedge activity to suspicious_flows.csv
+                h_row = {
+                    "date":            today_str,
+                    "time":            now_str,
+                    "ticker":          "SPY",
+                    "contract":        "HEDGE_ACTIVITY",
+                    "expiry_days":     "",
+                    "volume":          "",
+                    "notional":        "",
+                    "execution":       "HEDGE",
+                    "flag_score":      hedge_score,
+                    "flag_reasons":    " | ".join(hedge_reasons),
+                    "regime_at_time":  state.get("regime", ""),
+                    "spy_price":       spy_price,
+                    "vix_at_time":     round(vix_now, 2) if vix_now else "",
+                    "classification":  hedge_class,
+                    "claude_note":     cl_note.replace("\n\n💬 ", "")[:500],
+                    "next_day_move":   "",
+                    "outcome_correct": "UNKNOWN",
+                    "manual_flag":     "NO",
+                    "notes":           "",
+                }
+                append_suspicious_flow_row(h_row)
+                hedge_alerted.append(hedge_key)
+                state["hedge_alert_sent_today"] = hedge_alerted
+                print(f"🛡️ Hedge alert: {hedge_class} score={hedge_score}")
+            elif hedge_class == "HEDGE_SILENT" and hedge_key not in hedge_alerted:
+                # Silent log only
+                h_row = {
+                    "date":            today_str,
+                    "time":            now_str,
+                    "ticker":          "SPY",
+                    "contract":        "HEDGE_ACTIVITY",
+                    "expiry_days":     "",
+                    "volume":          "",
+                    "notional":        "",
+                    "execution":       "HEDGE",
+                    "flag_score":      hedge_score,
+                    "flag_reasons":    " | ".join(hedge_reasons),
+                    "regime_at_time":  state.get("regime", ""),
+                    "spy_price":       spy_price,
+                    "vix_at_time":     round(vix_now, 2) if vix_now else "",
+                    "classification":  hedge_class,
+                    "claude_note":     "",
+                    "next_day_move":   "",
+                    "outcome_correct": "UNKNOWN",
+                    "manual_flag":     "NO",
+                    "notes":           "",
+                }
+                append_suspicious_flow_row(h_row)
+                hedge_alerted.append(hedge_key)
+                state["hedge_alert_sent_today"] = hedge_alerted
+                print(f"📝 Hedge silent log: score={hedge_score}")
+        except Exception as he:
+            print(f"Hedge detection error: {he}")
+        # ────────────────────────────────────────────────────────
+
+        for contract in data:
+            try:
+                ctype  = str(contract.get("type", "")).upper()
+                strike = float(contract.get("strike", 0) or 0)
+                volume = float(contract.get("volume", 0) or 0)
+                exec_  = str(contract.get("execution_estimate", "")).upper()
+
+                # Build a dedup key: contract + date + execution
+                side    = "C" if "CALL" in ctype else "P"
+                key     = f"{strike}{side}_{today_str}_{exec_[:4]}"
+                if key in alerted_today or key in silent_today:
+                    continue
+
+                score, reasons, classification, notional, days_to_exp =                     score_suspicious_flow(contract)
+
+                if classification == "IGNORE":
+                    continue
+
+                contract_label = f"SPY ${strike:.0f}{'C' if 'CALL' in ctype else 'P'}"
+
+                flow_row = {
+                    "date":           today_str,
+                    "time":           now_str,
+                    "ticker":         "SPY",
+                    "contract":       contract_label,
+                    "expiry_days":    days_to_exp if days_to_exp is not None else "",
+                    "volume":         int(volume),
+                    "notional":       int(notional),
+                    "execution":      exec_,
+                    "flag_score":     score,
+                    "flag_reasons":   " | ".join(reasons),
+                    "regime_at_time": state.get("regime", ""),
+                    "spy_price":      spy_price,
+                    "vix_at_time":    round(vix_now, 2) if vix_now else "",
+                    "classification": classification,
+                    "claude_note":    "",
+                    "next_day_move":  "",
+                    "outcome_correct":"UNKNOWN",
+                    "manual_flag":    "NO",
+                    "notes":          "",
+                }
+
+                if classification in ("WATCH", "HIGH_CONVICTION"):
+                    # Write Claude note — cap at 2 per session to save API credits
+                    flow_claude_count = len([r for r in state.get("flow_alerts_sent_today", [])
+                                             if not r.endswith("_MANUAL")])
+                    claude_note = (write_flow_alert_with_claude(flow_row, score, reasons)
+                                   if flow_claude_count < 2 else None)
+                    if claude_note:
+                        flow_row["claude_note"] = claude_note[:500]
+
+                    # Build alert text
+                    emoji  = "🚨" if classification == "HIGH_CONVICTION" else "⚠️"
+                    r_text = "\n".join(f"  → {r}" for r in reasons)
+                    alert_text = (
+                        f"{emoji} SUSPICIOUS FLOW — SPY\n"
+                        f"{'─'*35}\n"
+                        f"{now_str} PDT | Score: {score}/100\n\n"
+                        f"Contract: {contract_label}\n"
+                        f"Notional: ${notional:,.0f}\n"
+                        f"Execution: {exec_}\n"
+                        f"Expiry: {days_to_exp if days_to_exp is not None else '?'} days\n\n"
+                        f"⚑ WHY FLAGGED:\n{r_text}\n\n"
+                        f"Regime: {state.get('regime','?')} | SPY: ${spy_price}\n"
+                        + (f"\n💬 {claude_note}" if claude_note else "") +
+                        f"\n\nSaved to suspicious_flows.csv"
+                    )
+                    alert(alert_text)
+                    append_suspicious_flow_row(flow_row)
+                    alerted_today.append(key)
+                    state["flow_alerts_sent_today"] = alerted_today
+                    # Update state for gex_log auto-logger
+                    if score > state.get("current_flow_score", 0):
+                        state["current_flow_score"]          = score
+                        state["current_flow_classification"] = classification
+                        state["current_flow_contract"]       = contract_label
+                    print(f"🚨 Suspicious flow flagged: {contract_label} score={score} ({classification})")
+
+                elif classification == "SILENT":
+                    # Log silently, no alert
+                    append_suspicious_flow_row(flow_row)
+                    silent_today.append(key)
+                    state["flow_silent_log_today"] = silent_today
+                    if score > state.get("current_flow_score", 0):
+                        state["current_flow_score"]          = score
+                        state["current_flow_classification"] = "SILENT"
+                        state["current_flow_contract"]       = contract_label
+                    print(f"📝 Silent flow logged: {contract_label} score={score}")
+
+            except Exception as ce:
+                continue
+
+    except Exception as e:
+        print(f"check_suspicious_flow error: {e}")
+
+
+def load_suspicious_flow_context(days=30):
+    """
+    Loads suspicious_flows.csv into a compact summary for Claude.
+    Injected into morning brief and /report for pattern recognition.
+    """
+    try:
+        if not os.path.exists(SUSPICIOUS_FLOW_FILE):
+            return ""
+        with open(SUSPICIOUS_FLOW_FILE, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return ""
+
+        cutoff = (now_pdt() - timedelta(days=days)).strftime("%Y-%m-%d")
+        recent = [r for r in rows if r.get("date", "") >= cutoff]
+        if not recent:
+            return ""
+
+        # Stats
+        total       = len(recent)
+        high_conv   = [r for r in recent if r.get("classification") == "HIGH_CONVICTION"]
+        watch       = [r for r in recent if r.get("classification") == "WATCH"]
+        resolved    = [r for r in recent if r.get("outcome_correct") in ("YES","NO")]
+        correct     = sum(1 for r in resolved if r.get("outcome_correct") == "YES")
+        win_rate    = round(correct / len(resolved) * 100, 1) if resolved else 0
+
+        lines = [
+            f"SUSPICIOUS FLOW LOG ({days}d): {total} flags | "
+            f"{len(high_conv)} HIGH_CONVICTION | {len(watch)} WATCH",
+        ]
+        if resolved:
+            lines.append(f"  Predictive accuracy: {win_rate}% ({correct}/{len(resolved)} resolved)")
+
+        # Most recent HIGH_CONVICTION flags
+        for r in sorted(high_conv, key=lambda x: (x["date"], x["time"]))[-3:]:
+            ndm = r.get("next_day_move", "")
+            oc  = r.get("outcome_correct", "UNKNOWN")
+            lines.append(
+                f"  {r['date']} {r['time']}: {r.get('contract')} "
+                f"${int(float(r.get('notional',0))):,} {r.get('execution','')} "
+                f"score={r.get('flag_score')} → next_day={ndm} ({oc})"
+            )
+
+        # Today's flags
+        today_str = now_pdt().strftime("%Y-%m-%d")
+        today_flags = [r for r in recent if r.get("date") == today_str]
+        if today_flags:
+            lines.append(f"  TODAY: {len(today_flags)} flow(s) flagged")
+            for r in today_flags:
+                lines.append(
+                    f"    {r.get('time')}: {r.get('contract')} "
+                    f"${int(float(r.get('notional',0))):,} "
+                    f"score={r.get('flag_score')} {r.get('classification')}"
+                )
+                if r.get("claude_note"):
+                    lines.append(f"    Note: {r.get('claude_note')[:150]}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"load_suspicious_flow_context error: {e}")
+        return ""
+
+
+
+def _autofill_suspicious_flow_outcomes(prev_close, today_close):
+    """
+    Called at EOD. Fills next_day_move for flows flagged YESTERDAY.
+    Also fills outcome_correct: YES if flow direction matched next-day move.
+    """
+    try:
+        if not os.path.exists(SUSPICIOUS_FLOW_FILE):
+            return
+        with open(SUSPICIOUS_FLOW_FILE, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return
+
+        today_str     = now_pdt().strftime("%Y-%m-%d")
+        yesterday_str = (now_pdt() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        if prev_close is None or today_close is None:
+            return
+
+        point_move = round(today_close - prev_close, 2)
+        direction  = "UP" if point_move > 0.5 else "DOWN" if point_move < -0.5 else "FLAT"
+
+        updated = 0
+        for row in rows:
+            if row.get("date") != yesterday_str:
+                continue
+            if row.get("next_day_move", "") != "":
+                continue
+            row["next_day_move"] = point_move
+            # Determine if flow was predictive
+            contract = row.get("contract", "")
+            is_call  = contract.endswith("C")
+            is_put   = contract.endswith("P")
+            if (is_call and direction == "UP") or (is_put and direction == "DOWN"):
+                row["outcome_correct"] = "YES"
+            elif direction == "FLAT":
+                row["outcome_correct"] = "UNKNOWN"
+            else:
+                row["outcome_correct"] = "NO"
+            updated += 1
+
+        if updated > 0:
+            with open(SUSPICIOUS_FLOW_FILE, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=SUSPICIOUS_FLOW_HEADERS,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            with open(SUSPICIOUS_FLOW_FILE, "rb") as f:
+                cb = f.read()
+            today_str2 = now_pdt().strftime("%Y-%m-%d")
+            git_push_file(SUSPICIOUS_FLOW_FILE, cb, "github_flow_sha",
+                          f"Flow outcomes autofill [{today_str2}]: {updated} rows")
+            print(f"✅ Suspicious flow outcomes filled: {updated} rows | {direction} {point_move}pts")
+    except Exception as e:
+        print(f"_autofill_suspicious_flow_outcomes error: {e}")
+
+
+# ─────────────────────────────────────────────
+# MODULE: HEDGE ACTIVITY DETECTOR
+# ─────────────────────────────────────────────
+# Scores institutional hedging behavior 0-100.
+# Separate from suspicious flow — this catches
+# LEGITIMATE but TELLING hedge patterns:
+#
+#   A. Put buying into bullish regime    (0-25pts)
+#   B. Put/call ratio spike vs average   (0-20pts)
+#   C. Late-session hedge building       (0-20pts)
+#   D. Deep OTM put sweeps               (0-20pts)
+#   E. Rolling hedges (near→far)         (0-15pts)
+# ─────────────────────────────────────────────
+
+def score_hedge_activity(contracts, spy_price):
+    """
+    Scores institutional hedge activity from options contracts.
+    Returns (hedge_score, reasons, classification).
+
+    Key insight: hedging is NOT illegal or suspicious by itself.
+    But the PATTERN of when and how institutions hedge reveals
+    what they actually believe about future price direction.
+
+    A fund buying $5M in puts while Vol GEX is positive (bullish)
+    is not wrong — they are protecting their long book.
+    But it TELLS you they expect downside despite bullish structure.
+    """
+    hedge_score = 0
+    reasons     = []
+
+    try:
+        regime = state.get("regime", "UNKNOWN")
+        pdt    = now_pdt()
+        h, m   = pdt.hour, pdt.minute
+        mins_to_close = max(0, (13 * 60) - (h * 60 + m))
+
+        put_volume_total  = 0
+        call_volume_total = 0
+        put_notional      = 0
+        deep_otm_puts     = 0
+        near_term_put_vol = 0   # 0-5 days
+        far_term_put_oi   = 0   # 15+ days
+
+        if not contracts or spy_price <= 0:
+            return 0, [], "NONE"
+
+        for c in contracts:
+            try:
+                ctype  = str(c.get("type", "")).upper()
+                volume = float(c.get("volume", 0) or 0)
+                oi     = float(c.get("open_interest", 0) or 0)
+                strike = float(c.get("strike", 0) or 0)
+                ask    = float(c.get("ask", 0) or 0)
+                bid    = float(c.get("bid", 0) or 0)
+                exec_  = str(c.get("execution_estimate", "")).upper()
+                mid_px = (ask + bid) / 2 if ask and bid else ask
+
+                # Days to expiry
+                days_exp = None
+                try:
+                    exp_str = str(c.get("expiration_date", "") or "")
+                    if exp_str:
+                        exp_date = datetime.strptime(exp_str[:10], "%Y-%m-%d").date()
+                        days_exp = (exp_date - date.today()).days
+                except Exception:
+                    pass
+
+                is_put  = "PUT" in ctype
+                is_call = "CALL" in ctype
+                notional = volume * mid_px * 100 if mid_px > 0 else 0
+
+                if is_put:
+                    put_volume_total += volume
+                    put_notional     += notional
+                    otm_pct = ((spy_price - strike) / spy_price * 100
+                               if spy_price > 0 and strike > 0 else 0)
+                    if otm_pct >= 3.0:
+                        deep_otm_puts += notional
+                    if days_exp is not None:
+                        if days_exp <= 5:
+                            near_term_put_vol += volume
+                        elif days_exp >= 15:
+                            far_term_put_oi   += oi
+
+                elif is_call:
+                    call_volume_total += volume
+
+            except Exception:
+                continue
+
+        # ── FACTOR A: Put buying into bullish regime (0-25pts) ──
+        bull_regimes = ("HEDGE_UNWIND_CONFIRMED", "BULLISH_MOMENTUM", "HEDGE_UNWIND_EARLY")
+        if regime in bull_regimes and put_notional >= 500_000:
+            pts = 25 if put_notional >= 2_000_000 else 15 if put_notional >= 1_000_000 else 10
+            hedge_score += pts
+            reasons.append(
+                f"${put_notional/1e6:.1f}M put buying during {regime} "
+                f"— institutions hedging into bullish structure"
+            )
+        elif regime in bull_regimes and put_notional >= 200_000:
+            hedge_score += 5
+            reasons.append(
+                f"${put_notional/1e3:.0f}K put buying during bullish regime "
+                f"— minor hedge activity"
+            )
+
+        # ── FACTOR B: Put/call ratio spike (0-20pts) ────────────
+        if put_volume_total > 0 and call_volume_total > 0:
+            pc_ratio = put_volume_total / call_volume_total
+            history  = state.get("put_call_ratio_history", [])
+            if len(history) >= 3:
+                avg_pc = sum(history) / len(history)
+                if pc_ratio > avg_pc * 2.0:
+                    hedge_score += 20
+                    reasons.append(
+                        f"Put/call ratio {pc_ratio:.2f}x vs avg {avg_pc:.2f}x "
+                        f"({round(pc_ratio/avg_pc,1)}x spike) — unusual fear"
+                    )
+                elif pc_ratio > avg_pc * 1.5:
+                    hedge_score += 10
+                    reasons.append(
+                        f"Put/call ratio elevated {pc_ratio:.2f}x vs avg {avg_pc:.2f}x"
+                    )
+            # Update history
+            history.append(pc_ratio)
+            if len(history) > 20:
+                history.pop(0)
+            state["put_call_ratio_history"] = history
+
+        # ── FACTOR C: Late-session hedge building (0-20pts) ─────
+        if is_market_open() and mins_to_close <= 30 and put_notional >= 300_000:
+            pts = 20 if mins_to_close <= 15 else 12
+            hedge_score += pts
+            reasons.append(
+                f"${put_notional/1e3:.0f}K net put buying with "
+                f"{mins_to_close}min left — overnight hedge positioning"
+            )
+
+        # ── FACTOR D: Deep OTM put sweeps (0-20pts) ─────────────
+        if deep_otm_puts >= 500_000:
+            hedge_score += 20
+            reasons.append(
+                f"${deep_otm_puts/1e3:.0f}K deep OTM put buying (>3% below spot) "
+                f"— disaster hedge, expects large move down"
+            )
+        elif deep_otm_puts >= 200_000:
+            hedge_score += 10
+            reasons.append(
+                f"${deep_otm_puts/1e3:.0f}K deep OTM puts "
+                f"— tail risk protection"
+            )
+
+        # ── FACTOR E: Rolling hedges near→far (0-15pts) ─────────
+        if near_term_put_vol >= 5000 and far_term_put_oi >= 10000:
+            hedge_score += 15
+            reasons.append(
+                f"Near-term put volume ({int(near_term_put_vol):,}) + "
+                f"far-term put OI ({int(far_term_put_oi):,}) building "
+                f"— rolling hedges, extending duration"
+            )
+        elif far_term_put_oi >= 20000:
+            hedge_score += 8
+            reasons.append(
+                f"Far-term put OI ({int(far_term_put_oi):,}) accumulating "
+                f"— long-dated hedge building"
+            )
+
+        hedge_score = min(100, hedge_score)
+
+        if hedge_score >= 80:
+            classification = "HEDGE_HIGH"
+        elif hedge_score >= 60:
+            classification = "HEDGE_WATCH"
+        elif hedge_score >= 40:
+            classification = "HEDGE_SILENT"
+        else:
+            classification = "NONE"
+
+        return hedge_score, reasons, classification
+
+    except Exception as e:
+        print(f"score_hedge_activity error: {e}")
+        return 0, [], "NONE"
 
 # ─────────────────────────────────────────────
 # SCHEDULE — all UTC (PDT = UTC-7)
@@ -4292,6 +5208,7 @@ schedule.every(5).minutes.do(check_doji_transition)
 schedule.every(5).minutes.do(check_gamma_wall_approach)
 schedule.every(5).minutes.do(analyze_open_candle)
 schedule.every(5).minutes.do(midnight_reset)
+schedule.every(5).minutes.do(check_suspicious_flow)
 schedule.every(60).minutes.do(check_heartbeat)
 schedule.every(90).minutes.do(run_overnight_check)
 
