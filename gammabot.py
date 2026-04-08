@@ -2993,7 +2993,7 @@ async def handle_telegram_updates():
         # FIX: use offset to prevent re-processing old updates (stops spam loop)
         last_id = state.get("telegram_last_update_id", 0)
         offset  = last_id + 1 if last_id > 0 else None
-        updates = await bot.get_updates(timeout=5, offset=offset)
+        updates = await bot.get_updates(read_timeout=5, offset=offset)
         today_str = now_pdt().strftime("%Y-%m-%d")
         for update in updates:
             if update.update_id > state.get("telegram_last_update_id", 0):
